@@ -4,9 +4,20 @@ from pathlib import Path
 from typing import List, Dict, Optional
 import chardet
 from loguru import logger
-import pypdf
+try:
+    import pypdf
+except ImportError:
+    import PyPDF2 as pypdf
+
 from docx import Document
-import openpyxl
+
+try:
+    import openpyxl
+    EXCEL_SUPPORT = True
+except ImportError:
+    EXCEL_SUPPORT = False
+    logger.warning("openpyxl이 설치되지 않았습니다. Excel 파일 지원이 비활성화됩니다.")
+
 import markdown
 from src.Config.config import settings
 
@@ -61,7 +72,11 @@ class DocumentLoader:
         elif extension == '.md':
             return self._load_markdown(file_path)
         elif extension == '.xlsx':
-            return self._load_excel(file_path)
+            if EXCEL_SUPPORT:
+                return self._load_excel(file_path)
+            else:
+                logger.warning(f"Excel 지원이 비활성화되어 파일을 건너뜁니다: {file_path}")
+                return None
         else:
             logger.warning(f"지원하지 않는 파일 형식: {extension}")
             return None
@@ -86,12 +101,26 @@ class DocumentLoader:
     def _load_pdf(self, file_path: Path) -> str:
         """PDF 파일 로드"""
         text = []
-        with open(file_path, 'rb') as f:
-            reader = pypdf.PdfReader(f)
-            for page in reader.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    text.append(page_text)
+        try:
+            with open(file_path, 'rb') as f:
+                # pypdf (최신) API 시도
+                if hasattr(pypdf, 'PdfReader'):
+                    reader = pypdf.PdfReader(f)
+                    for page in reader.pages:
+                        page_text = page.extract_text()
+                        if page_text:
+                            text.append(page_text)
+                # PyPDF2 (구버전) API 시도
+                else:
+                    reader = pypdf.PdfFileReader(f)
+                    for page_num in range(reader.numPages):
+                        page = reader.getPage(page_num)
+                        page_text = page.extractText()
+                        if page_text:
+                            text.append(page_text)
+        except Exception as e:
+            logger.error(f"PDF 파일 로드 실패 {file_path}: {e}")
+            return ""
         return '\n'.join(text)
     
     def _load_docx(self, file_path: Path) -> str:

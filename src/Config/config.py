@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 from typing import Optional, List
 from pydantic_settings import BaseSettings
-from pydantic import Field
+from pydantic import Field, computed_field
 from dotenv import load_dotenv
 
 # .env 파일 로드
@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     
     ollama_host: str = Field(default="http://localhost:11434", env="OLLAMA_HOST")
     ollama_model: str = Field(default="gemma3:1b", env="OLLAMA_MODEL")
+    ollama_embedding_model: str = Field(default="bge-m3:latest", env="OLLAMA_EMBEDDING_MODEL")
     
     # LightRAG 설정
     lightrag_working_dir: Path = Field(default=Path("./rag_storage"), env="LIGHTRAG_WORKING_DIR")
@@ -34,12 +35,35 @@ class Settings(BaseSettings):
     language: str = Field(default="ko", env="LANGUAGE")
     max_tokens: int = Field(default=2000, env="MAX_TOKENS")
     temperature: float = Field(default=0.7, env="TEMPERATURE")
+    embedding_dim: Optional[int] = Field(default=None, env="EMBEDDING_DIM")
     
     # 문서 처리 설정
-    supported_extensions: List[str] = Field(
-        default=[".txt", ".pdf", ".docx", ".md", ".xlsx"],
-        env="SUPPORTED_EXTENSIONS"
+    supported_extensions_str: str = Field(
+        alias="SUPPORTED_EXTENSIONS",
+        default=".txt,.pdf,.docx,.md,.xlsx"
     )
+
+    @computed_field
+    @property
+    def supported_extensions(self) -> List[str]:
+        """
+        SUPPORTED_EXTENSIONS 환경 변수를 파싱하여 리스트로 변환합니다.
+        콤마로 구분된 문자열 (e.g., ".txt,.pdf") 또는 JSON 배열 (e.g., '[\".txt\", \".pdf\"]') 형식을 지원합니다.
+        """
+        value = self.supported_extensions_str.strip()
+        
+        if not value:
+            return [".txt", ".pdf", ".docx", ".md", ".xlsx"]
+        
+        if value.startswith('[') and value.endswith(']'):
+            try:
+                import json
+                return json.loads(value)
+            except json.JSONDecodeError:
+                pass
+
+        return [ext.strip() for ext in value.split(',') if ext.strip()]
+
     max_file_size_mb: int = Field(default=50, env="MAX_FILE_SIZE_MB")
     encoding: str = Field(default="utf-8", env="ENCODING")
     
@@ -48,10 +72,13 @@ class Settings(BaseSettings):
     backup_dir: Path = Field(default=Path("./backup"), env="BACKUP_DIR")
     logs_dir: Path = Field(default=Path("./logs"), env="LOGS_DIR")
     
+    # LLM 제공자 선택 (auto, ollama, openai, openrouter)
+    llm_provider: str = Field(default="auto", env="LLM_PROVIDER")
+    
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
-    
+        
     def get_llm_service(self) -> str:
         """사용 가능한 LLM 서비스 확인"""
         if self.openrouter_api_key:
@@ -69,4 +96,4 @@ class Settings(BaseSettings):
         self.logs_dir.mkdir(parents=True, exist_ok=True)
 
 # 전역 설정 인스턴스
-settings = Settings() 
+settings = Settings()

@@ -16,14 +16,16 @@ from colorama import init as colorama_init
 # Windows 터미널 색상 지원
 colorama_init()
 
-# 로거 설정
+# 로거 설정 (디버그 모드 활성화)
 logger.remove()
 logger.add(
     sys.stderr,
+    level="DEBUG",  # 디버그 모드 강제 활성화
     format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
 )
 logger.add(
     "logs/app.log",
+    level="DEBUG",  # 디버그 모드 강제 활성화
     rotation="10 MB",
     retention="7 days",
     format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}"
@@ -44,28 +46,29 @@ class TerminalRAG:
     """터미널 기반 RAG 인터페이스"""
     
     def __init__(self):
-        self.rag_service = None
+        self.rag_service: Optional[RAGService] = None
         self.is_initialized = False
+        self.console = Console()
     
     async def initialize(self):
         """서비스 초기화"""
-        if not self.is_initialized:
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                console=console,
-            ) as progress:
-                task = progress.add_task("[cyan]LightRAG 시스템 초기화 중...", total=None)
-                
-                try:
-                    self.rag_service = RAGService()
-                    self.is_initialized = True
-                    progress.update(task, description="[green]초기화 완료!")
-                except Exception as e:
-                    progress.update(task, description=f"[red]초기화 실패: {e}")
-                    raise
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            transient=True,
+        ) as progress:
+            task = progress.add_task("[cyan]LightRAG 시스템 초기화 중...", total=None)
+
+            try:
+                self.rag_service = await RAGService.create()
+                self.is_initialized = True
+                progress.update(task, description="[green]초기화 완료!")
+            except Exception as e:
+                progress.update(task, description=f"[red]초기화 실패: {e}")
+                self.console.print(f"[bold red]오류 발생: {e}[/bold red]")
+                raise
     
-    async def load_documents(self):
+    async def load_documents(self, directory: str = "input"):
         """문서 로드 및 인덱싱"""
         loader = DocumentLoader()
         documents = loader.load_documents()
@@ -260,6 +263,58 @@ def info():
     table.add_row("언어", settings.language)
     
     console.print(table)
+
+
+@app.command()
+def test():
+    """시스템 구성 요소 테스트"""
+    async def run():
+        console.print("[bold cyan]LightRAG 시스템 테스트[/bold cyan]")
+        
+        # 1. LLM 서비스 테스트
+        try:
+            console.print("\n[yellow]1. LLM 서비스 테스트...[/yellow]")
+            llm_service = await get_llm_service()
+            test_response = await llm_service.generate("Hello, this is a test.")
+            console.print(f"[green]✓ LLM 응답: {test_response[:100]}...[/green]")
+        except Exception as e:
+            console.print(f"[red]✗ LLM 서비스 오류: {e}[/red]")
+            return
+        
+        # 2. 임베딩 테스트
+        try:
+            console.print("\n[yellow]2. 임베딩 서비스 테스트...[/yellow]")
+            embedding = await llm_service.embed("test text")
+            console.print(f"[green]✓ 임베딩 차원: {len(embedding)}[/green]")
+        except Exception as e:
+            console.print(f"[red]✗ 임베딩 서비스 오류: {e}[/red]")
+            return
+        
+        # 3. RAG 서비스 테스트
+        try:
+            console.print("\n[yellow]3. RAG 서비스 초기화 테스트...[/yellow]")
+            rag_service = await RAGService.create()
+            console.print("[green]✓ RAG 서비스 초기화 성공[/green]")
+        except Exception as e:
+            console.print(f"[red]✗ RAG 서비스 오류: {e}[/red]")
+            return
+        
+        # 4. 문서 로드 테스트
+        try:
+            console.print("\n[yellow]4. 문서 로드 테스트...[/yellow]")
+            loader = DocumentLoader()
+            documents = loader.load_documents()
+            console.print(f"[green]✓ 로드된 문서 수: {len(documents)}[/green]")
+            if documents:
+                total_chars = sum(len(doc['content']) for doc in documents)
+                console.print(f"[green]✓ 총 문자 수: {total_chars:,}[/green]")
+        except Exception as e:
+            console.print(f"[red]✗ 문서 로드 오류: {e}[/red]")
+            return
+        
+        console.print("\n[bold green]모든 테스트 통과![/bold green]")
+    
+    asyncio.run(run())
 
 
 if __name__ == "__main__":

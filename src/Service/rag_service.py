@@ -4,176 +4,300 @@ from typing import List, Dict, Optional
 from pathlib import Path
 from loguru import logger
 from lightrag import LightRAG
-from lightrag.llm import ollama_model_complete, ollama_embedding
-from lightrag.llm import openai_complete_if_cache, openai_embedding
 from src.Config.config import settings
-from src.Service.llm_service import get_llm_service
+from src.Service.llm_service import get_llm_service, LLMService
 from src.Service.document_loader import DocumentLoader
+
+# 전역 LLM 서비스 (직렬화 문제 해결을 위해)
+_global_llm_service: Optional[LLMService] = None
 
 
 class RAGService:
     """LightRAG를 활용한 RAG 서비스"""
-    
-    def __init__(self):
-        self.working_dir = str(settings.lightrag_working_dir)
-        self.chunk_size = settings.lightrag_chunk_size
-        self.chunk_overlap = settings.lightrag_chunk_overlap
-        self.llm_service_type = settings.get_llm_service()
-        self.rag = None
+
+    # __init__은 비동기일 수 없으므로, 비동기 초기화를 위한 별도 메서드를 만듭니다.
+    def __init__(self, llm_service: LLMService, rag_instance: Optional[LightRAG]):
         self.document_loader = DocumentLoader()
-        self._initialize_rag()
-    
-    def _initialize_rag(self):
-        """LightRAG 초기화"""
+        self.llm_service = llm_service
+        self.rag = rag_instance
+
+    @classmethod
+    async def create(cls) -> "RAGService":
+        """RAGService의 비동기 생성자"""
+        llm_service = await get_llm_service()
+        rag_instance = await cls.a_initialize_rag(llm_service)
+        return cls(llm_service, rag_instance)
+
+    @staticmethod
+    async def a_initialize_rag(llm_service: LLMService) -> Optional[LightRAG]:
+        """LightRAG 초기화 (비동기)"""
         try:
-            # 디렉토리 생성
             settings.create_directories()
+
+            # 전역 변수로 LLM 서비스 저장 (직렬화 문제 해결)
+            global _global_llm_service
+            _global_llm_service = llm_service
+
+            # 직렬화 가능한 래퍼 함수들 생성
+            async def llm_model_func(prompt: str, system_prompt=None, history_messages=[], keyword_extraction=False, **kwargs) -> str:
+                # LightRAG에서 전달하는 매개변수들을 처리하고 LLM 서비스가 지원하는 것만 전달
+                filtered_kwargs = {
+                    k: v for k, v in kwargs.items() 
+                    if k in ['temperature', 'max_tokens']
+                }
+                
+                # 시스템 프롬프트가 있는 경우 포함
+                final_prompt = prompt
+                if system_prompt:
+                    final_prompt = f"{system_prompt}\n\n{prompt}"
+                
+                # 재시도 로직 (최대 3회)
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        result = await _global_llm_service.generate(final_prompt, **filtered_kwargs)
+                        if result and result.strip():  # 비어있지 않은 응답만 반환
+                            logger.debug(f"LLM 응답 생성 성공 (길이: {len(result)})")
+                            return result
+                        else:
+                            logger.warning(f"LLM이 빈 응답을 반환했습니다 (시도 {attempt + 1}/{max_retries})")
+                    except Exception as e:
+                        logger.error(f"LLM 생성 실패 (시도 {attempt + 1}/{max_retries}): {e}")
+                        if attempt == max_retries - 1:  # 마지막 시도
+                            logger.error("모든 재시도 실패, 기본 응답 반환")
+                            return f"LLM 서비스에 일시적인 문제가 발생했습니다. 잠시 후 다시 시도해주세요."
+                        
+                        # 재시도 전 잠시 대기
+                        await asyncio.sleep(1 * (attempt + 1))  # 점진적 백오프
+                
+                return "LLM 서비스 응답을 받을 수 없습니다."
+
+            async def embedding_func(texts):
+                """LightRAG 호환 임베딩 함수"""
+                try:
+                    logger.debug(f"임베딩 요청: {type(texts)}, 길이: {len(texts) if isinstance(texts, list) else 'N/A'}")
+                    
+                    # 입력 처리 - LightRAG는 다양한 형태로 텍스트를 전달할 수 있음
+                    if isinstance(texts, str):
+                        # 단일 문자열인 경우
+                        if not texts.strip():
+                            logger.warning("빈 문자열에 대한 임베딩")
+                            return [0.0] * _global_llm_service.embedding_dim
+                        
+                        result = await _global_llm_service.embed(texts)
+                        logger.debug(f"임베딩 결과 차원: {len(result)}")
+                        return result  # 리스트 형태로 반환
+                        
+                    elif isinstance(texts, list):
+                        # 리스트인 경우
+                        if not texts:
+                            logger.warning("빈 텍스트 리스트에 대한 임베딩")
+                            return [[0.0] * _global_llm_service.embedding_dim]
+                        
+                        # 각 텍스트에 대해 임베딩 생성
+                        results = []
+                        for i, text in enumerate(texts):
+                            if not text or not str(text).strip():
+                                logger.warning(f"빈 텍스트 항목 {i}에 대한 임베딩")
+                                embedding = [0.0] * _global_llm_service.embedding_dim
+                            else:
+                                embedding = await _global_llm_service.embed(str(text))
+                                logger.debug(f"텍스트 {i} 임베딩 차원: {len(embedding)}")
+                            results.append(embedding)
+                        
+                        return results  # 중첩 리스트 형태로 반환
+                    else:
+                        # 기타 형태 처리
+                        text_str = str(texts)
+                        if not text_str.strip():
+                            return [0.0] * _global_llm_service.embedding_dim
+                        
+                        result = await _global_llm_service.embed(text_str)
+                        return result
+                        
+                except Exception as e:
+                    logger.error(f"임베딩 함수에서 오류 발생: {e}")
+                    # 더미 벡터 반환
+                    dummy_dim = _global_llm_service.embedding_dim
+                    if isinstance(texts, list) and len(texts) > 1:
+                        # 리스트인 경우 각 항목에 대해 더미 벡터 생성
+                        return [[0.0] * dummy_dim for _ in texts]
+                    else:
+                        # 단일 벡터 반환
+                        return [0.0] * dummy_dim
+
+            # LightRAG에서 EmbeddingFunc 래퍼 사용
+            from lightrag.utils import EmbeddingFunc
             
-            # LLM 서비스에 따른 설정
-            if self.llm_service_type == "ollama":
-                self.rag = LightRAG(
-                    working_dir=self.working_dir,
-                    llm_model_func=self._ollama_complete,
-                    embedding_func=self._ollama_embedding,
-                    chunk_token_size=self.chunk_size,
-                    chunk_overlap_token_size=self.chunk_overlap,
-                )
-                logger.info(f"LightRAG 초기화 완료 (Ollama: {settings.ollama_model})")
+            embedding_wrapper = EmbeddingFunc(
+                embedding_dim=llm_service.embedding_dim,
+                max_token_size=8192,
+                func=embedding_func
+            )
             
-            elif self.llm_service_type == "openai":
-                self.rag = LightRAG(
-                    working_dir=self.working_dir,
-                    llm_model_func=openai_complete_if_cache,
-                    llm_model_name=settings.openai_model,
-                    embedding_func=openai_embedding,
-                    embedding_model=settings.lightrag_embedding_model,
-                    chunk_token_size=self.chunk_size,
-                    chunk_overlap_token_size=self.chunk_overlap,
-                    api_key=settings.openai_api_key,
-                )
-                logger.info(f"LightRAG 초기화 완료 (OpenAI: {settings.openai_model})")
+            rag_instance = LightRAG(
+                working_dir=str(settings.lightrag_working_dir),
+                llm_model_func=llm_model_func,
+                embedding_func=embedding_wrapper,
+                chunk_token_size=settings.lightrag_chunk_size,
+                chunk_overlap_token_size=settings.lightrag_chunk_overlap,
+            )
             
-            elif self.llm_service_type == "openrouter":
-                # OpenRouter는 커스텀 함수 사용
-                self.rag = LightRAG(
-                    working_dir=self.working_dir,
-                    llm_model_func=self._openrouter_complete,
-                    embedding_func=self._openrouter_embedding,
-                    chunk_token_size=self.chunk_size,
-                    chunk_overlap_token_size=self.chunk_overlap,
-                )
-                logger.info(f"LightRAG 초기화 완료 (OpenRouter: {settings.openrouter_model})")
+            logger.debug("LightRAG 저장소 초기화 시작...")
+            # LightRAG 저장소 초기화 (필수)
+            await rag_instance.initialize_storages()
+            logger.debug("LightRAG 저장소 초기화 완료")
             
+            logger.debug("파이프라인 상태 초기화 시작...")
+            # 파이프라인 상태 초기화 (필수)
+            from lightrag.kg.shared_storage import initialize_pipeline_status
+            await initialize_pipeline_status()
+            logger.debug("파이프라인 상태 초기화 완료")
+            
+            provider = settings.llm_provider
+            if provider == 'auto':
+                provider = settings.get_llm_service()  # 실제 사용될 서비스
+            logger.info(f"LightRAG 초기화 완료 ({provider} 서비스, 임베딩 차원: {embedding_wrapper.embedding_dim})")
+            logger.debug(f"작업 디렉토리: {settings.lightrag_working_dir}")
+            logger.debug(f"청크 크기: {settings.lightrag_chunk_size}, 오버랩: {settings.lightrag_chunk_overlap}")
+            return rag_instance
         except Exception as e:
             logger.error(f"LightRAG 초기화 실패: {e}")
             raise
-    
-    async def _ollama_complete(self, prompt: str, **kwargs) -> str:
-        """Ollama 완성 함수"""
-        return await ollama_model_complete(
-            prompt,
-            model_name=settings.ollama_model,
-            host=settings.ollama_host,
-            **kwargs
-        )
-    
-    async def _ollama_embedding(self, text: str, **kwargs) -> List[float]:
-        """Ollama 임베딩 함수"""
-        return await ollama_embedding(
-            text,
-            model_name=settings.ollama_model,
-            host=settings.ollama_host,
-            **kwargs
-        )
-    
-    async def _openrouter_complete(self, prompt: str, **kwargs) -> str:
-        """OpenRouter 완성 함수"""
-        from openai import AsyncOpenAI
-        client = AsyncOpenAI(
-            api_key=settings.openrouter_api_key,
-            base_url=settings.openrouter_base_url
-        )
-        
-        response = await client.chat.completions.create(
-            model=settings.openrouter_model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=kwargs.get('temperature', settings.temperature),
-            max_tokens=kwargs.get('max_tokens', settings.max_tokens),
-        )
-        return response.choices[0].message.content
-    
-    async def _openrouter_embedding(self, text: str, **kwargs) -> List[float]:
-        """OpenRouter 임베딩 함수 (OpenAI 사용)"""
-        if settings.openai_api_key:
-            return await openai_embedding(
-                text,
-                model=settings.lightrag_embedding_model,
-                api_key=settings.openai_api_key,
-                **kwargs
-            )
-        else:
-            # 간단한 더미 임베딩
-            import hashlib
-            hash_obj = hashlib.sha256(text.encode())
-            hash_bytes = hash_obj.digest()
-            return [float(b) / 255.0 for b in hash_bytes[:384]]
-    
+
     async def insert_documents(self, documents: List[Dict[str, str]] = None):
         """문서를 RAG에 삽입"""
+        if self.rag is None:
+            logger.error("RAG 서비스가 초기화되지 않았습니다.")
+            return
         try:
             if documents is None:
-                # input 폴더에서 문서 로드
                 documents = self.document_loader.load_documents()
-            
+
             if not documents:
                 logger.warning("삽입할 문서가 없습니다.")
                 return
+
+            # 파일 경로와 내용을 조합한 포맷으로 변경
+            formatted_contents = []
+            for doc in documents:
+                # 파일 경로를 포함하여 내용을 구성
+                formatted_content = f"[Source File: {doc['name']}]\n{doc['content']}"
+                formatted_contents.append(formatted_content)
             
-            # 문서 내용만 추출
-            contents = [doc['content'] for doc in documents]
-            
-            # 배치로 삽입
+            # 문서 내용 로그 (디버깅용)
+            for i, doc in enumerate(documents):
+                logger.debug(f"문서 {i+1} ({doc['path']}) 내용 (첫 200자): {doc['content'][:200]}")
+
             logger.info(f"{len(documents)}개 문서 삽입 시작...")
-            await self.rag.ainsert(contents)
-            logger.info("문서 삽입 완료")
+            # 기본 ainsert 방법과 file_paths 방법 둘 다 시도
+            try:
+                await self.rag.ainsert(formatted_contents)
+                logger.info(f"문서 삽입 완료 - 총 {len(formatted_contents)}개 문서, 소스 정보 포함")
+            except Exception as e:
+                logger.warning(f"formatted_contents 방식 실패: {e}, 기본 방식 시도...")
+                # 기본 방식으로 fallback
+                contents = [doc['content'] for doc in documents]
+                await self.rag.ainsert(contents)
+                logger.info(f"문서 삽입 완료 - 총 {len(contents)}개 문서 (기본 방식)")
             
+            # 인덱싱 상태 확인
+            try:
+                storage_info = await self.get_indexed_info()
+                logger.info(f"인덱스 상태: {storage_info}")
+            except Exception as e:
+                logger.warning(f"인덱스 상태 확인 실패: {e}")
+
         except Exception as e:
             logger.error(f"문서 삽입 실패: {e}")
             raise
-    
+
     async def query(self, question: str, mode: str = "hybrid") -> str:
         """RAG에 질의"""
+        if self.rag is None:
+            logger.error("RAG 서비스가 초기화되지 않았습니다.")
+            return "RAG 서비스가 초기화되지 않았습니다."
         try:
-            # mode: naive, local, global, hybrid
             logger.debug(f"질의: {question} (모드: {mode})")
+
+            # 한국어 프롬프트 시스템을 LLM 단계에서 처리하도록 변경
+            original_question = question
+
+            # LightRAG API 호환성 수정
+            from lightrag import QueryParam
+            param = QueryParam(mode=mode)
             
-            # 한국어 질의인 경우 프롬프트 개선
-            if self._is_korean(question):
-                question = f"다음 질문에 대해 한국어로 답변해주세요: {question}"
+            logger.debug("LightRAG 질의 시작...")
+            response = await self.rag.aquery(original_question, param=param)
+            logger.debug(f"LightRAG 응답 타입: {type(response)}")
+            logger.debug(f"LightRAG 응답 내용 (첫 200자): {str(response)[:200]}")
             
-            response = await self.rag.aquery(question, param={"mode": mode})
-            return response
+            # 응답이 dict 형태인 경우 처리
+            if isinstance(response, dict):
+                if 'response' in response:
+                    answer = response['response']
+                elif 'answer' in response:
+                    answer = response['answer']
+                else:
+                    # dict의 첫 번째 값을 반환하거나 문자열로 변환
+                    answer = str(response)
+            else:
+                answer = response
             
+            logger.debug(f"처리된 답변: {answer}")
+            
+            # no-context 응답인 경우 다른 모드로 재시도
+            if answer and "[no-context]" in str(answer):
+                logger.warning(f"{mode} 모드에서 컨텍스트를 찾지 못했습니다. naive 모드로 재시도...")
+                try:
+                    param = QueryParam(mode="naive")
+                    response = await self.rag.aquery(original_question, param=param)
+                    if isinstance(response, dict):
+                        if 'response' in response:
+                            answer = response['response']
+                        elif 'answer' in response:
+                            answer = response['answer']
+                        else:
+                            answer = str(response)
+                    else:
+                        answer = response
+                    logger.debug(f"naive 모드 응답: {answer}")
+                except Exception as e:
+                    logger.warning(f"naive 모드 재시도 실패: {e}")
+                
+            # 한국어 질문에 대해서는 LLM에게 한국어로 답변하도록 후처리
+            if answer and self._is_korean(original_question) and not self._is_korean(answer) and "[no-context]" not in str(answer):
+                # 한국어로 다시 답변 요청
+                korean_prompt = f"다음 답변을 한국어로 번역해주세요:\n\n{answer}"
+                try:
+                    korean_answer = await _global_llm_service.generate(korean_prompt)
+                    return korean_answer if korean_answer else answer
+                except Exception as e:
+                    logger.warning(f"한국어 번역 실패: {e}")
+                    return answer
+            
+            return answer if answer else "답변을 생성할 수 없습니다."
+
         except Exception as e:
             logger.error(f"질의 실패: {e}")
+            logger.exception("질의 실패 상세 정보")
             return f"오류가 발생했습니다: {str(e)}"
-    
+
     def _is_korean(self, text: str) -> bool:
         """텍스트가 한국어인지 확인"""
         korean_chars = sum(1 for char in text if '가' <= char <= '힣')
         return korean_chars / len(text) > 0.3 if text else False
-    
+
     async def get_indexed_info(self) -> Dict[str, any]:
         """인덱싱된 정보 반환"""
         try:
-            # 저장된 파일 확인
-            storage_path = Path(self.working_dir)
+            storage_path = Path(settings.lightrag_working_dir)
             info = {
                 'working_dir': str(storage_path),
                 'exists': storage_path.exists(),
                 'files': []
             }
-            
+
             if storage_path.exists():
                 for file in storage_path.iterdir():
                     if file.is_file():
@@ -181,7 +305,7 @@ class RAGService:
                             'name': file.name,
                             'size': file.stat().st_size
                         })
-            
+
             return info
         except Exception as e:
             logger.error(f"인덱스 정보 조회 실패: {e}")
