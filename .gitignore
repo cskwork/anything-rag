@@ -2,7 +2,7 @@
 .venv/
 venv/
 env/
-
+input/
 # 환경 설정
 .env
 *.env.local

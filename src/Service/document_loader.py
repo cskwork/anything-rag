@@ -46,9 +46,17 @@ class DocumentLoader:
                     
                     content = self.load_file(file_path)
                     if content:
+                        # input 디렉토리 기준 상대 경로 계산
+                        try:
+                            relative_path = file_path.relative_to(directory)
+                        except ValueError:
+                            # 상대 경로 계산 실패시 파일명만 사용
+                            relative_path = file_path.name
+                        
                         documents.append({
                             'path': str(file_path),
                             'name': file_path.name,
+                            'relative_path': str(relative_path),
                             'content': content,
                             'type': file_path.suffix.lower()
                         })
