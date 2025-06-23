@@ -311,11 +311,17 @@ class RAGService:
 
     async def query(self, question: str, mode: str = "hybrid") -> str:
         """RAG에 질의"""
+        # 디버깅: 메서드 진입 시점 로그
+        logger.debug(f"[QUERY_ENTRY] 받은 질문: '{question}' (길이: {len(question)}, 타입: {type(question)})")
+        logger.debug(f"[QUERY_ENTRY] 질문 바이트: {question.encode('utf-8')!r}")
+        
         if self.rag is None:
             logger.error("RAG 서비스가 초기화되지 않았습니다.")
             return "RAG 서비스가 초기화되지 않았습니다."
         try:
             logger.debug(f"질의: {question} (모드: {mode})")
+            # 더 안전한 로그 출력
+            logger.debug(f"[SAFE_LOG] 질의: {repr(question)} (모드: {mode})")
 
             # 한국어 프롬프트 시스템을 LLM 단계에서 처리하도록 변경
             original_question = question

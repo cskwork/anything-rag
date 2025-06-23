@@ -152,6 +152,9 @@ class TerminalRAG:
                 # 질문 입력
                 question = Prompt.ask("\n[bold green]질문[/bold green]")
                 
+                # 디버깅: 입력 직후 로그
+                logger.debug(f"[INPUT] 원본 질문: '{question}' (길이: {len(question)})")
+                
                 # 종료 명령 확인
                 if question.lower() in ['exit', 'quit', 'q']:
                     console.print("[yellow]시스템을 종료합니다.[/yellow]")
@@ -201,19 +204,23 @@ class TerminalRAG:
                     continue
                 
                 # RAG 질의
-                with Progress(
-                    SpinnerColumn(),
-                    TextColumn("[progress.description]{task.description}"),
-                    console=console,
-                ) as progress:
-                    task = progress.add_task("[cyan]답변 생성 중...", total=None)
+                # with Progress(
+                #     SpinnerColumn(),
+                #     TextColumn("[progress.description]{task.description}"),
+                #     console=console,
+                # ) as progress:
+                #     task = progress.add_task("[cyan]답변 생성 중...", total=None)
                     
-                    try:
-                        response = await self.rag_service.query(question)
-                        progress.update(task, description="[green]완료!")
-                    except Exception as e:
-                        progress.update(task, description=f"[red]오류: {e}")
-                        continue
+                try:
+                    # 디버깅: query 호출 직전 로그
+                    logger.debug(f"[BEFORE_QUERY] 질문: '{question}' (길이: {len(question)})")
+                    console.print("[cyan]답변 생성 중...[/cyan]")
+                    response = await self.rag_service.query(question)
+                    # progress.update(task, description="[green]완료!")
+                except Exception as e:
+                    # progress.update(task, description=f"[red]오류: {e}")
+                    console.print(f"[red]오류: {e}[/red]")
+                    continue
                 
                 # 답변 표시
                 console.print("\n[bold blue]답변:[/bold blue]")
