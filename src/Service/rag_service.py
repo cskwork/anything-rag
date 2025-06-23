@@ -255,17 +255,25 @@ class RAGService:
             logger.error(f"LightRAG 초기화 실패: {e}")
             raise
 
-    async def insert_documents(self, documents: Optional[List[Dict[str, str]]] = None):
-        """문서를 RAG에 삽입"""
+    async def insert_documents(self, documents: Optional[List[Dict[str, str]]] = None, only_new: bool = True):
+        """문서를 RAG에 삽입
+        
+        Args:
+            documents: 삽입할 문서 리스트 (None이면 자동 로드)
+            only_new: True면 신규/변경된 파일만, False면 모든 파일
+        """
         if self.rag is None:
             logger.error("RAG 서비스가 초기화되지 않았습니다.")
             return
         try:
             if documents is None:
-                documents = self.document_loader.load_documents()
+                documents = self.document_loader.load_documents(only_new=only_new)
 
             if not documents:
-                logger.warning("삽입할 문서가 없습니다.")
+                if only_new:
+                    logger.info("새로 추가되거나 변경된 문서가 없습니다.")
+                else:
+                    logger.warning("삽입할 문서가 없습니다.")
                 return
 
             # LightRAG 전용 file_paths 매개변수 사용
@@ -276,16 +284,19 @@ class RAGService:
             for i, doc in enumerate(documents):
                 logger.debug(f"문서 {i+1} ({doc['path']}) 내용 (첫 200자): {doc['content'][:200]}")
 
-            logger.info(f"{len(documents)}개 문서 삽입 시작...")
+            logger.info(f"{len(documents)}개 문서 임베딩 시작...")
             # LightRAG의 file_paths 매개변수를 사용하여 올바른 소스 정보 제공
             try:
                 await self.rag.ainsert(contents, file_paths=file_paths)
-                logger.info(f"문서 삽입 완료 - 총 {len(contents)}개 문서, 파일 경로 정보 포함")
+                logger.info(f"문서 임베딩 완료 - 총 {len(contents)}개 문서, 파일 경로 정보 포함")
             except Exception as e:
                 logger.warning(f"file_paths 방식 실패: {e}, 기본 방식 시도...")
                 # 기본 방식으로 fallback
                 await self.rag.ainsert(contents)
-                logger.info(f"문서 삽입 완료 - 총 {len(contents)}개 문서 (기본 방식)")
+                logger.info(f"문서 임베딩 완료 - 총 {len(contents)}개 문서 (기본 방식)")
+            
+            # 문서들을 임베딩 완료로 표시
+            self.document_loader.mark_documents_embedded(documents)
             
             # 인덱싱 상태 확인
             try:

@@ -68,13 +68,29 @@ class TerminalRAG:
                 self.console.print(f"[bold red]오류 발생: {e}[/bold red]")
                 raise
     
-    async def load_documents(self, directory: str = "input"):
-        """문서 로드 및 인덱싱"""
+    async def load_documents(self, directory: str = "input", force_reload: bool = False):
+        """문서 로드 및 인덱싱
+        
+        Args:
+            directory: 문서 디렉토리
+            force_reload: True면 모든 파일 재로드, False면 신규/변경된 파일만
+        """
         loader = DocumentLoader()
-        documents = loader.load_documents()
+        
+        # 임베딩 상태 정보 표시
+        embedding_status = loader.get_embedding_status()
+        if embedding_status['embedded_files_count'] > 0 and not force_reload:
+            console.print(f"[dim]이미 임베딩된 파일: {embedding_status['embedded_files_count']}개[/dim]")
+        
+        documents = loader.load_documents(only_new=not force_reload)
         
         if not documents:
-            console.print("[yellow]경고: input/ 폴더에 문서가 없습니다.[/yellow]")
+            if force_reload:
+                console.print("[yellow]경고: input/ 폴더에 문서가 없습니다.[/yellow]")
+            else:
+                console.print("[green]모든 문서가 이미 임베딩되어 있습니다. 새로운 작업이 없습니다.[/green]")
+                if embedding_status['embedded_files_count'] > 0:
+                    console.print(f"[dim]총 {embedding_status['embedded_files_count']}개 파일이 임베딩됨[/dim]")
             return
         
         # 문서 통계 표시
@@ -84,11 +100,19 @@ class TerminalRAG:
         table.add_column("항목", style="cyan")
         table.add_column("값", style="magenta")
         
+        if force_reload:
+            table.add_row("모드", "[red]전체 재로드[/red]")
+        else:
+            table.add_row("모드", "[green]신규/변경 파일만[/green]")
+        
         table.add_row("총 문서 수", str(stats['total_documents']))
         table.add_row("총 문자 수", f"{stats['total_characters']:,}")
         
         for doc_type, count in stats['by_type'].items():
             table.add_row(f"{doc_type} 파일", str(count))
+        
+        if embedding_status['embedded_files_count'] > 0:
+            table.add_row("기존 임베딩", f"{embedding_status['embedded_files_count']}개 파일")
         
         console.print(table)
         
@@ -98,13 +122,13 @@ class TerminalRAG:
             TextColumn("[progress.description]{task.description}"),
             console=console,
         ) as progress:
-            task = progress.add_task("[cyan]문서 인덱싱 중...", total=None)
+            task = progress.add_task("[cyan]문서 임베딩 중...", total=None)
             
             try:
-                await self.rag_service.insert_documents(documents)
-                progress.update(task, description="[green]인덱싱 완료!")
+                await self.rag_service.insert_documents(documents, only_new=not force_reload)
+                progress.update(task, description="[green]임베딩 완료!")
             except Exception as e:
-                progress.update(task, description=f"[red]인덱싱 실패: {e}")
+                progress.update(task, description=f"[red]임베딩 실패: {e}")
                 raise
     
     async def interactive_mode(self):
@@ -143,16 +167,35 @@ class TerminalRAG:
                     await self.load_documents()
                     continue
                 
+                if question.lower() == '/reload-all':
+                    await self.load_documents(force_reload=True)
+                    continue
+                
+                if question.lower() == '/reset':
+                    # 임베딩 상태 초기화 확인
+                    from rich.prompt import Confirm
+                    if Confirm.ask("[yellow]모든 임베딩 상태를 초기화하시겠습니까?[/yellow]"):
+                        loader = DocumentLoader()
+                        loader.reset_embedding_status()
+                        console.print("[green]임베딩 상태 초기화 완료. 다음 로드시 모든 파일이 재처리됩니다.[/green]")
+                    continue
+                
                 if question.lower() == '/help':
                     help_text = """
 사용 가능한 명령어:
-- /info    : 시스템 정보 표시
-- /reload  : 문서 다시 로드
-- /help    : 도움말 표시
+- /info       : 시스템 정보 표시
+- /reload     : 신규/변경된 문서만 다시 로드
+- /reload-all : 모든 문서 강제 재로드
+- /reset      : 임베딩 상태 초기화
+- /help       : 도움말 표시
 - exit/quit/q : 종료
 
 질의 모드:
 기본적으로 hybrid 모드를 사용합니다.
+
+파일 처리:
+- 기본적으로 신규 또는 변경된 파일만 임베딩합니다
+- 파일 변경은 MD5 해시와 수정 시간으로 감지합니다
                     """
                     console.print(Panel(help_text, title="도움말", border_style="blue"))
                     continue
@@ -186,7 +229,9 @@ class TerminalRAG:
 # CLI 명령어들
 @app.command()
 def chat(
-    load_docs: bool = typer.Option(True, "--load-docs/--no-load-docs", help="시작 시 문서 로드 여부")
+    load_docs: bool = typer.Option(True, "--load-docs/--no-load-docs", help="시작 시 문서 로드 여부"),
+    reset_embeddings: bool = typer.Option(False, "--reset-embeddings", help="시작 시 모든 임베딩 상태 초기화"),
+    force_reload: bool = typer.Option(False, "--force-reload", help="모든 문서 강제 재로드")
 ):
     """대화형 Q&A 모드 시작"""
     async def run():
@@ -195,9 +240,16 @@ def chat(
         # 초기화
         await terminal_rag.initialize()
         
+        # 임베딩 상태 초기화 (옵션)
+        if reset_embeddings:
+            from src.Service.document_loader import DocumentLoader
+            loader = DocumentLoader()
+            loader.reset_embedding_status()
+            console.print("[yellow]임베딩 상태 초기화 완료[/yellow]")
+        
         # 문서 로드
         if load_docs:
-            await terminal_rag.load_documents()
+            await terminal_rag.load_documents(force_reload=force_reload)
         
         # 대화형 모드
         await terminal_rag.interactive_mode()
@@ -206,12 +258,23 @@ def chat(
 
 
 @app.command()
-def load():
+def load(
+    force_reload: bool = typer.Option(False, "--force-reload", help="모든 문서 강제 재로드"),
+    reset_embeddings: bool = typer.Option(False, "--reset-embeddings", help="임베딩 상태 초기화 후 로드")
+):
     """input/ 폴더의 문서를 로드하고 인덱싱"""
     async def run():
         terminal_rag = TerminalRAG()
         await terminal_rag.initialize()
-        await terminal_rag.load_documents()
+        
+        # 임베딩 상태 초기화 (옵션)
+        if reset_embeddings:
+            from src.Service.document_loader import DocumentLoader
+            loader = DocumentLoader()
+            loader.reset_embedding_status()
+            console.print("[yellow]임베딩 상태 초기화 완료[/yellow]")
+        
+        await terminal_rag.load_documents(force_reload=force_reload)
         console.print("[green]문서 로드 완료![/green]")
     
     asyncio.run(run())
