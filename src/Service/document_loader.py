@@ -110,9 +110,25 @@ class DocumentLoader:
         logger.info(f"{len(documents)}개 문서를 임베딩 완료로 표시")
     
     def reset_embedding_status(self):
-        """모든 임베딩 상태 초기화"""
+        """모든 임베딩 상태와 RAG 저장소 초기화"""
+        import shutil
+        
+        # 1. 파일 추적 메타데이터 초기화
         self.file_tracker.clear_metadata()
-        logger.info("모든 파일의 임베딩 상태 초기화 완료")
+        logger.info("모든 파일의 임베딩 상태 추적 초기화 완료")
+        
+        # 2. RAG 저장소 디렉토리 삭제
+        storage_dir = settings.lightrag_working_dir
+        if storage_dir.exists():
+            try:
+                shutil.rmtree(storage_dir)
+                logger.info(f"RAG 저장소 디렉토리 삭제 완료: {storage_dir}")
+            except Exception as e:
+                logger.error(f"RAG 저장소 디렉토리 삭제 실패: {storage_dir}, 오류: {e}")
+                # 필요한 경우 예외를 다시 발생시키거나 사용자에게 알림
+                # raise e
+        else:
+            logger.info(f"RAG 저장소 디렉토리가 존재하지 않아 건너뜀: {storage_dir}")
     
     def get_embedding_status(self) -> Dict:
         """현재 임베딩 상태 정보 반환"""

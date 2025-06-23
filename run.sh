@@ -86,8 +86,14 @@ echo "설치 완료! LightRAG 시스템을 시작합니다."
 echo "========================================"
 echo ""
 
-# 메인 프로그램 실행
-python main.py chat
+# Q&A 시스템 실행
+# 스크립트에 전달된 모든 인자를 python main.py로 전달
+# 인자가 없으면 기본 'chat' 명령어 실행
+if [ $# -eq 0 ]; then
+  python main.py chat
+else
+  python main.py "$@"
+fi
 
 # 가상환경 비활성화
 deactivate 

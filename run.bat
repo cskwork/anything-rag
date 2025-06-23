@@ -91,8 +91,15 @@ echo 설치 완료! LightRAG 시스템을 시작합니다.
 echo ========================================
 echo.
 
-:: 메인 프로그램 실행
-python main.py chat
+REM Q&A 시스템 실행
+REM 스크립트에 전달된 인자를 python main.py로 전달
+IF "%1"=="" (
+    REM 인자가 없으면 기본 'chat' 명령어 실행
+    python main.py chat
+) ELSE (
+    REM 인자가 있으면 그대로 전달
+    python main.py %*
+)
 
 :: 가상환경 비활성화
 deactivate

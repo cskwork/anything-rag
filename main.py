@@ -185,20 +185,36 @@ class TerminalRAG:
                 
                 if question.lower() == '/help':
                     help_text = """
-사용 가능한 명령어:
-- /info       : 시스템 정보 표시
+🔧 사용 가능한 명령어:
+- /info       : 시스템 정보 표시 (LLM 서비스, 인덱스 상태 등)
 - /reload     : 신규/변경된 문서만 다시 로드
-- /reload-all : 모든 문서 강제 재로드
-- /reset      : 임베딩 상태 초기화
-- /help       : 도움말 표시
-- exit/quit/q : 종료
+- /reload-all : 모든 문서 강제 재로드 (전체 재처리)
+- /reset      : 임베딩 상태 초기화 (다음 로드시 모든 파일 재처리)
+- /help       : 이 도움말 표시
+- exit/quit/q : 프로그램 종료
 
-질의 모드:
-기본적으로 hybrid 모드를 사용합니다.
+📋 사용 예시:
+- "LightRAG의 주요 특징은 무엇인가요?" (일반 질문)
+- "문서에서 성능 최적화 방법을 찾아주세요" (문서 검색)
+- "앞서 말한 내용을 다시 설명해주세요" (대화 맥락 활용)
 
-파일 처리:
+🔍 질의 모드:
+기본적으로 hybrid 모드를 사용합니다 (로컬+글로벌 검색 결합)
+- naive: 단순 벡터 검색
+- local: 로컬 지식 그래프 검색  
+- global: 글로벌 지식 그래프 검색
+- hybrid: 최적 결과를 위한 결합 방식
+
+📁 파일 처리:
 - 기본적으로 신규 또는 변경된 파일만 임베딩합니다
 - 파일 변경은 MD5 해시와 수정 시간으로 감지합니다
+- 지원 형식: .txt, .pdf, .docx, .md, .xlsx
+- input/ 폴더에 문서를 넣고 /reload 명령어 사용
+
+💡 팁:
+- 구체적인 질문일수록 더 정확한 답변을 받을 수 있습니다
+- 한국어와 영어 질문 모두 지원합니다
+- 이전 대화 내용을 기억하므로 연관 질문이 가능합니다
                     """
                     console.print(Panel(help_text, title="도움말", border_style="blue"))
                     continue
@@ -249,10 +265,13 @@ def chat(
         
         # 임베딩 상태 초기화 (옵션)
         if reset_embeddings:
+            console.print("[yellow]임베딩 상태 초기화 중...[/yellow]")
             from src.Service.document_loader import DocumentLoader
             loader = DocumentLoader()
             loader.reset_embedding_status()
-            console.print("[yellow]임베딩 상태 초기화 완료[/yellow]")
+            console.print("[green]임베딩 상태 초기화 완료. RAG 서비스를 재초기화합니다.[/green]")
+            # RAG 서비스를 재초기화하여 삭제된 저장소를 다시 생성
+            await terminal_rag.initialize()
         
         # 문서 로드
         if load_docs:
@@ -276,10 +295,13 @@ def load(
         
         # 임베딩 상태 초기화 (옵션)
         if reset_embeddings:
+            console.print("[yellow]임베딩 상태 초기화 중...[/yellow]")
             from src.Service.document_loader import DocumentLoader
             loader = DocumentLoader()
             loader.reset_embedding_status()
-            console.print("[yellow]임베딩 상태 초기화 완료[/yellow]")
+            console.print("[green]임베딩 상태 초기화 완료. RAG 서비스를 재초기화합니다.[/green]")
+            # RAG 서비스를 재초기화하여 삭제된 저장소를 다시 생성
+            await terminal_rag.initialize()
         
         await terminal_rag.load_documents(force_reload=force_reload)
         console.print("[green]문서 로드 완료![/green]")

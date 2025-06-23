@@ -113,14 +113,21 @@ class FileTracker:
         return len(self.metadata)
     
     def clear_metadata(self):
-        """모든 메타데이터 삭제 (초기화)"""
+        """모든 메타데이터와 메타데이터 파일 삭제"""
         self.metadata = {}
+        logger.debug("메모리 내 메타데이터 초기화")
+        
         try:
             if self.metadata_file.exists():
+                logger.debug(f"메타데이터 파일 삭제 시도: {self.metadata_file}")
                 self.metadata_file.unlink()
-            logger.info("임베딩 메타데이터 초기화 완료")
-        except Exception as e:
-            logger.error(f"메타데이터 초기화 실패: {e}")
+                logger.info(f"임베딩 메타데이터 파일 삭제 완료: {self.metadata_file}")
+            else:
+                logger.info("임베딩 메타데이터 파일이 존재하지 않아 삭제를 건너뜁니다.")
+        except OSError as e:
+            logger.error(f"메타데이터 파일 삭제 실패: {e}")
+            # 필요한 경우 예외를 다시 발생
+            # raise
     
     def remove_missing_files(self):
         """존재하지 않는 파일들을 메타데이터에서 제거"""
