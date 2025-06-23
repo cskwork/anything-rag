@@ -20,6 +20,7 @@ except ImportError:
 
 import markdown
 from src.Config.config import settings
+from src.Utils.file_tracker import FileTracker
 
 
 class DocumentLoader:
@@ -28,13 +29,23 @@ class DocumentLoader:
     def __init__(self):
         self.supported_extensions = settings.supported_extensions
         self.max_file_size = settings.max_file_size_mb * 1024 * 1024  # MB to bytes
+        self.file_tracker = FileTracker()
     
-    def load_documents(self, directory: Path = None) -> List[Dict[str, str]]:
-        """디렉토리의 모든 지원 문서 로드"""
+    def load_documents(self, directory: Path = None, only_new: bool = True) -> List[Dict[str, str]]:
+        """디렉토리의 모든 지원 문서 로드
+        
+        Args:
+            directory: 로드할 디렉토리 (기본값: settings.input_dir)
+            only_new: True면 신규/변경된 파일만, False면 모든 파일 (기본값: True)
+        """
         if directory is None:
             directory = settings.input_dir
         
+        # 삭제된 파일들의 메타데이터 정리
+        self.file_tracker.remove_missing_files()
+        
         documents = []
+        all_documents = []
         
         for file_path in directory.rglob("*"):
             if file_path.is_file() and file_path.suffix.lower() in self.supported_extensions:
@@ -46,19 +57,83 @@ class DocumentLoader:
                     
                     content = self.load_file(file_path)
                     if content:
-                        documents.append({
+                        # input 디렉토리 기준 상대 경로 계산
+                        try:
+                            relative_path = file_path.relative_to(directory)
+                        except ValueError:
+                            # 상대 경로 계산 실패시 파일명만 사용
+                            relative_path = file_path.name
+                        
+                        doc_info = {
                             'path': str(file_path),
                             'name': file_path.name,
+                            'relative_path': str(relative_path),
                             'content': content,
                             'type': file_path.suffix.lower()
-                        })
-                        logger.info(f"문서 로드 완료: {file_path.name}")
+                        }
+                        
+                        all_documents.append(doc_info)
+                        logger.debug(f"문서 스캔 완료: {file_path.name}")
+                        
                 except Exception as e:
                     logger.error(f"문서 로드 실패 {file_path}: {e}")
         
-        logger.info(f"총 {len(documents)}개 문서 로드 완료")
+        # only_new가 True면 신규/변경된 파일만 필터링
+        if only_new:
+            documents = self.file_tracker.get_new_or_changed_files(all_documents)
+            
+            if len(documents) < len(all_documents):
+                logger.info(f"전체 {len(all_documents)}개 파일 중 {len(documents)}개가 신규/변경됨")
+                skipped_count = len(all_documents) - len(documents)
+                logger.info(f"{skipped_count}개 파일은 이미 임베딩되어 건너뜀")
+            else:
+                logger.info(f"모든 {len(documents)}개 파일이 신규/변경됨")
+        else:
+            documents = all_documents
+            logger.info(f"모든 파일 로드 모드: {len(documents)}개 파일")
+        
+        # 로드된 파일들을 임베딩 완료로 표시 (실제 임베딩은 RAG 서비스에서 처리)
+        for doc in documents:
+            logger.info(f"신규/변경 문서 로드: {doc['name']}")
+        
         return documents
     
+    def load_all_documents(self, directory: Path = None) -> List[Dict[str, str]]:
+        """모든 문서를 강제로 로드 (임베딩 상태 무시)"""
+        return self.load_documents(directory, only_new=False)
+    
+    def mark_documents_embedded(self, documents: List[Dict[str, str]]):
+        """문서들을 임베딩 완료로 표시"""
+        for doc in documents:
+            file_path = Path(doc['path'])
+            self.file_tracker.mark_file_embedded(file_path)
+        logger.info(f"{len(documents)}개 문서를 임베딩 완료로 표시")
+    
+    def reset_embedding_status(self):
+        """모든 임베딩 상태와 RAG 저장소 초기화"""
+        import shutil
+        
+        # 1. 파일 추적 메타데이터 초기화
+        self.file_tracker.clear_metadata()
+        logger.info("모든 파일의 임베딩 상태 추적 초기화 완료")
+        
+        # 2. RAG 저장소 디렉토리 삭제
+        storage_dir = settings.lightrag_working_dir
+        if storage_dir.exists():
+            try:
+                shutil.rmtree(storage_dir)
+                logger.info(f"RAG 저장소 디렉토리 삭제 완료: {storage_dir}")
+            except Exception as e:
+                logger.error(f"RAG 저장소 디렉토리 삭제 실패: {storage_dir}, 오류: {e}")
+                # 필요한 경우 예외를 다시 발생시키거나 사용자에게 알림
+                # raise e
+        else:
+            logger.info(f"RAG 저장소 디렉토리가 존재하지 않아 건너뜀: {storage_dir}")
+    
+    def get_embedding_status(self) -> Dict:
+        """현재 임베딩 상태 정보 반환"""
+        return self.file_tracker.get_status_info()
+
     def load_file(self, file_path: Path) -> Optional[str]:
         """파일 형식에 따라 적절한 로더 호출"""
         extension = file_path.suffix.lower()

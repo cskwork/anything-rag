@@ -1,6 +1,6 @@
 """LightRAG 기반 RAG 서비스"""
 import asyncio
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 from pathlib import Path
 from loguru import logger
 from lightrag import LightRAG
@@ -10,6 +10,9 @@ from src.Service.document_loader import DocumentLoader
 
 # 전역 LLM 서비스 (직렬화 문제 해결을 위해)
 _global_llm_service: Optional[LLMService] = None
+# 동시성 제어를 위한 세마포어 (최대 2개의 동시 요청만 허용)
+_llm_semaphore = asyncio.Semaphore(2)
+_embedding_semaphore = asyncio.Semaphore(3)
 
 
 class RAGService:
@@ -20,6 +23,8 @@ class RAGService:
         self.document_loader = DocumentLoader()
         self.llm_service = llm_service
         self.rag = rag_instance
+        # 대화 히스토리 저장용 리스트
+        self.conversation_history: list[dict[str, str]] = []  # [{role:"user"|"assistant", content:str}]
 
     @classmethod
     async def create(cls) -> "RAGService":
@@ -29,10 +34,42 @@ class RAGService:
         return cls(llm_service, rag_instance)
 
     @staticmethod
+    async def _check_llm_health(llm_service: LLMService, max_attempts: int = 3) -> bool:
+        """LLM 서비스 상태 확인"""
+        for attempt in range(max_attempts):
+            try:
+                # 간단한 테스트 프롬프트로 서비스 상태 확인
+                async with _llm_semaphore:  # 세마포어 사용
+                    test_response = await llm_service.generate(
+                        "Hello", 
+                        temperature=0.1, 
+                        max_tokens=10
+                    )
+                if test_response and test_response.strip():
+                    logger.info(f"LLM 서비스 상태 확인 완료 (시도 {attempt + 1}/{max_attempts})")
+                    return True
+                else:
+                    logger.warning(f"LLM 서비스 빈 응답 (시도 {attempt + 1}/{max_attempts})")
+            except Exception as e:
+                logger.warning(f"LLM 서비스 상태 확인 실패 (시도 {attempt + 1}/{max_attempts}): {e}")
+                if attempt < max_attempts - 1:
+                    wait_time = 2 ** attempt  # 지수적 백오프 (2, 4, 8초)
+                    logger.info(f"LLM 서비스 안정화 대기 중... ({wait_time}초)")
+                    await asyncio.sleep(wait_time)
+        
+        logger.error("LLM 서비스 상태 확인 실패")
+        return False
+
+    @staticmethod
     async def a_initialize_rag(llm_service: LLMService) -> Optional[LightRAG]:
         """LightRAG 초기화 (비동기)"""
         try:
             settings.create_directories()
+
+            # LLM 서비스 상태 확인
+            logger.info("LLM 서비스 상태 확인 중...")
+            if not await RAGService._check_llm_health(llm_service):
+                logger.warning("LLM 서비스가 불안정하지만 계속 진행합니다...")
 
             # 전역 변수로 LLM 서비스 저장 (직렬화 문제 해결)
             global _global_llm_service
@@ -51,80 +88,134 @@ class RAGService:
                 if system_prompt:
                     final_prompt = f"{system_prompt}\n\n{prompt}"
                 
-                # 재시도 로직 (최대 3회)
-                max_retries = 3
-                for attempt in range(max_retries):
-                    try:
-                        result = await _global_llm_service.generate(final_prompt, **filtered_kwargs)
-                        if result and result.strip():  # 비어있지 않은 응답만 반환
-                            logger.debug(f"LLM 응답 생성 성공 (길이: {len(result)})")
-                            return result
-                        else:
-                            logger.warning(f"LLM이 빈 응답을 반환했습니다 (시도 {attempt + 1}/{max_retries})")
-                    except Exception as e:
-                        logger.error(f"LLM 생성 실패 (시도 {attempt + 1}/{max_retries}): {e}")
-                        if attempt == max_retries - 1:  # 마지막 시도
-                            logger.error("모든 재시도 실패, 기본 응답 반환")
-                            return f"LLM 서비스에 일시적인 문제가 발생했습니다. 잠시 후 다시 시도해주세요."
-                        
-                        # 재시도 전 잠시 대기
-                        await asyncio.sleep(1 * (attempt + 1))  # 점진적 백오프
-                
-                return "LLM 서비스 응답을 받을 수 없습니다."
+                # 세마포어를 사용한 동시성 제어
+                async with _llm_semaphore:
+                    # 재시도 로직 (최대 3회, 개선된 백오프)
+                    max_retries = 3
+                    for attempt in range(max_retries):
+                        try:
+                            if _global_llm_service is None:
+                                logger.error("전역 LLM 서비스가 없습니다")
+                                return "LLM 서비스가 초기화되지 않았습니다."
+                            
+                            result = await _global_llm_service.generate(final_prompt, **filtered_kwargs)
+                            if result and result.strip():  # 비어있지 않은 응답만 반환
+                                logger.debug(f"LLM 응답 생성 성공 (길이: {len(result)})")
+                                return result
+                            else:
+                                logger.warning(f"LLM이 빈 응답을 반환했습니다 (시도 {attempt + 1}/{max_retries})")
+                        except Exception as e:
+                            logger.error(f"LLM 생성 실패 (시도 {attempt + 1}/{max_retries}): {e}")
+                            if attempt == max_retries - 1:  # 마지막 시도
+                                logger.error("모든 재시도 실패, 기본 응답 반환")
+                                return f"LLM 서비스에 일시적인 문제가 발생했습니다. 잠시 후 다시 시도해주세요."
+                            
+                            # 재시도 전 대기 시간 증가 (지수적 백오프)
+                            wait_time = (2 ** attempt) + 2  # 4, 6, 10초로 증가
+                            logger.info(f"LLM 재시도 대기 중... ({wait_time}초)")
+                            await asyncio.sleep(wait_time)
+                    
+                    return "LLM 서비스 응답을 받을 수 없습니다."
 
             async def embedding_func(texts):
-                """LightRAG 호환 임베딩 함수"""
-                try:
-                    logger.debug(f"임베딩 요청: {type(texts)}, 길이: {len(texts) if isinstance(texts, list) else 'N/A'}")
-                    
-                    # 입력 처리 - LightRAG는 다양한 형태로 텍스트를 전달할 수 있음
-                    if isinstance(texts, str):
-                        # 단일 문자열인 경우
-                        if not texts.strip():
-                            logger.warning("빈 문자열에 대한 임베딩")
-                            return [0.0] * _global_llm_service.embedding_dim
-                        
-                        result = await _global_llm_service.embed(texts)
-                        logger.debug(f"임베딩 결과 차원: {len(result)}")
-                        return result  # 리스트 형태로 반환
-                        
-                    elif isinstance(texts, list):
-                        # 리스트인 경우
-                        if not texts:
-                            logger.warning("빈 텍스트 리스트에 대한 임베딩")
-                            return [[0.0] * _global_llm_service.embedding_dim]
-                        
-                        # 각 텍스트에 대해 임베딩 생성
-                        results = []
-                        for i, text in enumerate(texts):
-                            if not text or not str(text).strip():
-                                logger.warning(f"빈 텍스트 항목 {i}에 대한 임베딩")
-                                embedding = [0.0] * _global_llm_service.embedding_dim
+                """LightRAG 호환 임베딩 함수 (동시성 제어 포함)"""
+                async with _embedding_semaphore:  # 임베딩 세마포어 사용
+                    try:
+                        if _global_llm_service is None:
+                            logger.error("전역 LLM 서비스가 없습니다")
+                            dummy_dim = 1024  # 기본 차원
+                            if isinstance(texts, list) and len(texts) > 1:
+                                return [[0.0] * dummy_dim for _ in texts]
                             else:
-                                embedding = await _global_llm_service.embed(str(text))
-                                logger.debug(f"텍스트 {i} 임베딩 차원: {len(embedding)}")
-                            results.append(embedding)
+                                return [0.0] * dummy_dim
                         
-                        return results  # 중첩 리스트 형태로 반환
-                    else:
-                        # 기타 형태 처리
-                        text_str = str(texts)
-                        if not text_str.strip():
-                            return [0.0] * _global_llm_service.embedding_dim
+                        logger.debug(f"임베딩 요청: {type(texts)}, 길이: {len(texts) if isinstance(texts, list) else 'N/A'}")
                         
-                        result = await _global_llm_service.embed(text_str)
-                        return result
-                        
-                except Exception as e:
-                    logger.error(f"임베딩 함수에서 오류 발생: {e}")
-                    # 더미 벡터 반환
-                    dummy_dim = _global_llm_service.embedding_dim
-                    if isinstance(texts, list) and len(texts) > 1:
-                        # 리스트인 경우 각 항목에 대해 더미 벡터 생성
-                        return [[0.0] * dummy_dim for _ in texts]
-                    else:
-                        # 단일 벡터 반환
-                        return [0.0] * dummy_dim
+                        # 입력 처리 - LightRAG는 다양한 형태로 텍스트를 전달할 수 있음
+                        if isinstance(texts, str):
+                            # 단일 문자열인 경우
+                            if not texts.strip():
+                                logger.warning("빈 문자열에 대한 임베딩")
+                                return [0.0] * _global_llm_service.embedding_dim
+                            
+                            # 재시도 로직 추가
+                            max_retries = 2
+                            for attempt in range(max_retries):
+                                try:
+                                    result = await _global_llm_service.embed(texts)
+                                    logger.debug(f"임베딩 결과 차원: {len(result)}")
+                                    return result  # 리스트 형태로 반환
+                                except Exception as e:
+                                    logger.warning(f"임베딩 실패 (시도 {attempt + 1}/{max_retries}): {e}")
+                                    if attempt < max_retries - 1:
+                                        await asyncio.sleep(1)  # 1초 대기
+                                    else:
+                                        raise
+                                
+                        elif isinstance(texts, list):
+                            # 리스트인 경우
+                            if not texts:
+                                logger.warning("빈 텍스트 리스트에 대한 임베딩")
+                                return [[0.0] * _global_llm_service.embedding_dim]
+                            
+                            # 각 텍스트에 대해 임베딩 생성 (순차 처리로 안정성 향상)
+                            results = []
+                            for i, text in enumerate(texts):
+                                if not text or not str(text).strip():
+                                    logger.warning(f"빈 텍스트 항목 {i}에 대한 임베딩")
+                                    embedding = [0.0] * _global_llm_service.embedding_dim
+                                else:
+                                    # 재시도 로직 추가
+                                    max_retries = 2
+                                    embedding = None
+                                    for attempt in range(max_retries):
+                                        try:
+                                            embedding = await _global_llm_service.embed(str(text))
+                                            logger.debug(f"텍스트 {i} 임베딩 차원: {len(embedding)}")
+                                            break
+                                        except Exception as e:
+                                            logger.warning(f"텍스트 {i} 임베딩 실패 (시도 {attempt + 1}/{max_retries}): {e}")
+                                            if attempt < max_retries - 1:
+                                                await asyncio.sleep(0.5)  # 0.5초 대기
+                                            else:
+                                                logger.error(f"텍스트 {i} 임베딩 완전 실패, 더미 벡터 사용")
+                                                embedding = [0.0] * _global_llm_service.embedding_dim
+                                results.append(embedding)
+                                
+                                # 텍스트 간 약간의 지연으로 서버 부하 완화
+                                if i < len(texts) - 1:
+                                    await asyncio.sleep(0.1)
+                            
+                            return results  # 중첩 리스트 형태로 반환
+                        else:
+                            # 기타 형태 처리
+                            text_str = str(texts)
+                            if not text_str.strip():
+                                return [0.0] * _global_llm_service.embedding_dim
+                            
+                            # 재시도 로직 추가
+                            max_retries = 2
+                            for attempt in range(max_retries):
+                                try:
+                                    result = await _global_llm_service.embed(text_str)
+                                    return result
+                                except Exception as e:
+                                    logger.warning(f"임베딩 실패 (시도 {attempt + 1}/{max_retries}): {e}")
+                                    if attempt < max_retries - 1:
+                                        await asyncio.sleep(1)
+                                    else:
+                                        raise
+                                
+                    except Exception as e:
+                        logger.error(f"임베딩 함수에서 오류 발생: {e}")
+                        # 더미 벡터 반환
+                        dummy_dim = _global_llm_service.embedding_dim if _global_llm_service else 1024
+                        if isinstance(texts, list) and len(texts) > 1:
+                            # 리스트인 경우 각 항목에 대해 더미 벡터 생성
+                            return [[0.0] * dummy_dim for _ in texts]
+                        else:
+                            # 단일 벡터 반환
+                            return [0.0] * dummy_dim
 
             # LightRAG에서 EmbeddingFunc 래퍼 사용
             from lightrag.utils import EmbeddingFunc
@@ -160,46 +251,54 @@ class RAGService:
             logger.info(f"LightRAG 초기화 완료 ({provider} 서비스, 임베딩 차원: {embedding_wrapper.embedding_dim})")
             logger.debug(f"작업 디렉토리: {settings.lightrag_working_dir}")
             logger.debug(f"청크 크기: {settings.lightrag_chunk_size}, 오버랩: {settings.lightrag_chunk_overlap}")
+            logger.info("동시성 제어: LLM 세마포어=2, 임베딩 세마포어=3")
             return rag_instance
         except Exception as e:
             logger.error(f"LightRAG 초기화 실패: {e}")
             raise
 
-    async def insert_documents(self, documents: List[Dict[str, str]] = None):
-        """문서를 RAG에 삽입"""
+    async def insert_documents(self, documents: Optional[List[Dict[str, str]]] = None, only_new: bool = True):
+        """문서를 RAG에 삽입
+        
+        Args:
+            documents: 삽입할 문서 리스트 (None이면 자동 로드)
+            only_new: True면 신규/변경된 파일만, False면 모든 파일
+        """
         if self.rag is None:
             logger.error("RAG 서비스가 초기화되지 않았습니다.")
             return
         try:
             if documents is None:
-                documents = self.document_loader.load_documents()
+                documents = self.document_loader.load_documents(only_new=only_new)
 
             if not documents:
-                logger.warning("삽입할 문서가 없습니다.")
+                if only_new:
+                    logger.info("새로 추가되거나 변경된 문서가 없습니다.")
+                else:
+                    logger.warning("삽입할 문서가 없습니다.")
                 return
 
-            # 파일 경로와 내용을 조합한 포맷으로 변경
-            formatted_contents = []
-            for doc in documents:
-                # 파일 경로를 포함하여 내용을 구성
-                formatted_content = f"[Source File: {doc['name']}]\n{doc['content']}"
-                formatted_contents.append(formatted_content)
+            # LightRAG 전용 file_paths 매개변수 사용
+            contents = [doc['content'] for doc in documents]
+            file_paths = [doc.get('relative_path', doc['name']) for doc in documents]
             
             # 문서 내용 로그 (디버깅용)
             for i, doc in enumerate(documents):
                 logger.debug(f"문서 {i+1} ({doc['path']}) 내용 (첫 200자): {doc['content'][:200]}")
 
-            logger.info(f"{len(documents)}개 문서 삽입 시작...")
-            # 기본 ainsert 방법과 file_paths 방법 둘 다 시도
+            logger.info(f"{len(documents)}개 문서 임베딩 시작...")
+            # LightRAG의 file_paths 매개변수를 사용하여 올바른 소스 정보 제공
             try:
-                await self.rag.ainsert(formatted_contents)
-                logger.info(f"문서 삽입 완료 - 총 {len(formatted_contents)}개 문서, 소스 정보 포함")
+                await self.rag.ainsert(contents, file_paths=file_paths)
+                logger.info(f"문서 임베딩 완료 - 총 {len(contents)}개 문서, 파일 경로 정보 포함")
             except Exception as e:
-                logger.warning(f"formatted_contents 방식 실패: {e}, 기본 방식 시도...")
+                logger.warning(f"file_paths 방식 실패: {e}, 기본 방식 시도...")
                 # 기본 방식으로 fallback
-                contents = [doc['content'] for doc in documents]
                 await self.rag.ainsert(contents)
-                logger.info(f"문서 삽입 완료 - 총 {len(contents)}개 문서 (기본 방식)")
+                logger.info(f"문서 임베딩 완료 - 총 {len(contents)}개 문서 (기본 방식)")
+            
+            # 문서들을 임베딩 완료로 표시
+            self.document_loader.mark_documents_embedded(documents)
             
             # 인덱싱 상태 확인
             try:
@@ -214,18 +313,31 @@ class RAGService:
 
     async def query(self, question: str, mode: str = "hybrid") -> str:
         """RAG에 질의"""
+        # 디버깅: 메서드 진입 시점 로그
+        logger.debug(f"[QUERY_ENTRY] 받은 질문: '{question}' (길이: {len(question)}, 타입: {type(question)})")
+        logger.debug(f"[QUERY_ENTRY] 질문 바이트: {question.encode('utf-8')!r}")
+        
         if self.rag is None:
             logger.error("RAG 서비스가 초기화되지 않았습니다.")
             return "RAG 서비스가 초기화되지 않았습니다."
         try:
             logger.debug(f"질의: {question} (모드: {mode})")
+            # 더 안전한 로그 출력
+            logger.debug(f"[SAFE_LOG] 질의: {repr(question)} (모드: {mode})")
 
             # 한국어 프롬프트 시스템을 LLM 단계에서 처리하도록 변경
             original_question = question
 
+            # --- 대화 히스토리 업데이트 (user) ---
+            self.conversation_history.append({"role": "user", "content": original_question})
+
             # LightRAG API 호환성 수정
             from lightrag import QueryParam
-            param = QueryParam(mode=mode)
+            param = QueryParam(
+                mode=mode,
+                conversation_history=self.conversation_history,
+                history_turns=settings.lightrag_history_turns,
+            )
             
             logger.debug("LightRAG 질의 시작...")
             response = await self.rag.aquery(original_question, param=param)
@@ -250,7 +362,11 @@ class RAGService:
             if answer and "[no-context]" in str(answer):
                 logger.warning(f"{mode} 모드에서 컨텍스트를 찾지 못했습니다. naive 모드로 재시도...")
                 try:
-                    param = QueryParam(mode="naive")
+                    param = QueryParam(
+                        mode="naive",
+                        conversation_history=self.conversation_history,
+                        history_turns=settings.lightrag_history_turns,
+                    )
                     response = await self.rag.aquery(original_question, param=param)
                     if isinstance(response, dict):
                         if 'response' in response:
@@ -270,13 +386,27 @@ class RAGService:
                 # 한국어로 다시 답변 요청
                 korean_prompt = f"다음 답변을 한국어로 번역해주세요:\n\n{answer}"
                 try:
-                    korean_answer = await _global_llm_service.generate(korean_prompt)
-                    return korean_answer if korean_answer else answer
+                    if _global_llm_service is not None:
+                        async with _llm_semaphore:  # 세마포어 사용
+                            korean_answer = await _global_llm_service.generate(korean_prompt)
+                            # assistant 메시지 저장
+                            final_ans = korean_answer if korean_answer else answer
+                            self.conversation_history.append({"role": "assistant", "content": str(final_ans)})
+                            return final_ans
+                    else:
+                        logger.warning("전역 LLM 서비스가 없어 한국어 번역을 건너뜁니다")
+                        self.conversation_history.append({"role": "assistant", "content": str(answer)})
+                        return answer
                 except Exception as e:
                     logger.warning(f"한국어 번역 실패: {e}")
+                    self.conversation_history.append({"role": "assistant", "content": str(answer)})
                     return answer
             
-            return answer if answer else "답변을 생성할 수 없습니다."
+            if answer:
+                self.conversation_history.append({"role": "assistant", "content": str(answer)})
+                return answer
+            else:
+                return "답변을 생성할 수 없습니다."
 
         except Exception as e:
             logger.error(f"질의 실패: {e}")
@@ -288,11 +418,11 @@ class RAGService:
         korean_chars = sum(1 for char in text if '가' <= char <= '힣')
         return korean_chars / len(text) > 0.3 if text else False
 
-    async def get_indexed_info(self) -> Dict[str, any]:
+    async def get_indexed_info(self) -> Dict[str, Any]:
         """인덱싱된 정보 반환"""
         try:
             storage_path = Path(settings.lightrag_working_dir)
-            info = {
+            info: Dict[str, Any] = {
                 'working_dir': str(storage_path),
                 'exists': storage_path.exists(),
                 'files': []

@@ -16,23 +16,23 @@ from colorama import init as colorama_init
 # Windows 터미널 색상 지원
 colorama_init()
 
-# 로거 설정 (디버그 모드 활성화)
+# 모듈 임포트 (설정을 먼저 로드하기 위해)
+from src.Config.config import settings
+
+# 로거 설정 (설정에서 로그 레벨 사용)
 logger.remove()
 logger.add(
     sys.stderr,
-    level="DEBUG",  # 디버그 모드 강제 활성화
+    level=settings.log_level,  # .env에서 LOG_LEVEL 사용
     format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
 )
 logger.add(
-    "logs/app.log",
-    level="DEBUG",  # 디버그 모드 강제 활성화
+    "logs/app.log", 
+    level=settings.log_level,  # .env에서 LOG_LEVEL 사용
     rotation="10 MB",
     retention="7 days",
     format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}"
 )
-
-# 모듈 임포트
-from src.Config.config import settings
 from src.Service.rag_service import RAGService
 from src.Service.document_loader import DocumentLoader
 from src.Service.llm_service import get_llm_service
@@ -68,13 +68,29 @@ class TerminalRAG:
                 self.console.print(f"[bold red]오류 발생: {e}[/bold red]")
                 raise
     
-    async def load_documents(self, directory: str = "input"):
-        """문서 로드 및 인덱싱"""
+    async def load_documents(self, directory: str = "input", force_reload: bool = False):
+        """문서 로드 및 인덱싱
+        
+        Args:
+            directory: 문서 디렉토리
+            force_reload: True면 모든 파일 재로드, False면 신규/변경된 파일만
+        """
         loader = DocumentLoader()
-        documents = loader.load_documents()
+        
+        # 임베딩 상태 정보 표시
+        embedding_status = loader.get_embedding_status()
+        if embedding_status['embedded_files_count'] > 0 and not force_reload:
+            console.print(f"[dim]이미 임베딩된 파일: {embedding_status['embedded_files_count']}개[/dim]")
+        
+        documents = loader.load_documents(only_new=not force_reload)
         
         if not documents:
-            console.print("[yellow]경고: input/ 폴더에 문서가 없습니다.[/yellow]")
+            if force_reload:
+                console.print("[yellow]경고: input/ 폴더에 문서가 없습니다.[/yellow]")
+            else:
+                console.print("[green]모든 문서가 이미 임베딩되어 있습니다. 새로운 작업이 없습니다.[/green]")
+                if embedding_status['embedded_files_count'] > 0:
+                    console.print(f"[dim]총 {embedding_status['embedded_files_count']}개 파일이 임베딩됨[/dim]")
             return
         
         # 문서 통계 표시
@@ -84,11 +100,19 @@ class TerminalRAG:
         table.add_column("항목", style="cyan")
         table.add_column("값", style="magenta")
         
+        if force_reload:
+            table.add_row("모드", "[red]전체 재로드[/red]")
+        else:
+            table.add_row("모드", "[green]신규/변경 파일만[/green]")
+        
         table.add_row("총 문서 수", str(stats['total_documents']))
         table.add_row("총 문자 수", f"{stats['total_characters']:,}")
         
         for doc_type, count in stats['by_type'].items():
             table.add_row(f"{doc_type} 파일", str(count))
+        
+        if embedding_status['embedded_files_count'] > 0:
+            table.add_row("기존 임베딩", f"{embedding_status['embedded_files_count']}개 파일")
         
         console.print(table)
         
@@ -98,13 +122,13 @@ class TerminalRAG:
             TextColumn("[progress.description]{task.description}"),
             console=console,
         ) as progress:
-            task = progress.add_task("[cyan]문서 인덱싱 중...", total=None)
+            task = progress.add_task("[cyan]문서 임베딩 중...", total=None)
             
             try:
-                await self.rag_service.insert_documents(documents)
-                progress.update(task, description="[green]인덱싱 완료!")
+                await self.rag_service.insert_documents(documents, only_new=not force_reload)
+                progress.update(task, description="[green]임베딩 완료!")
             except Exception as e:
-                progress.update(task, description=f"[red]인덱싱 실패: {e}")
+                progress.update(task, description=f"[red]임베딩 실패: {e}")
                 raise
     
     async def interactive_mode(self):
@@ -128,6 +152,9 @@ class TerminalRAG:
                 # 질문 입력
                 question = Prompt.ask("\n[bold green]질문[/bold green]")
                 
+                # 디버깅: 입력 직후 로그
+                logger.debug(f"[INPUT] 원본 질문: '{question}' (길이: {len(question)})")
+                
                 # 종료 명령 확인
                 if question.lower() in ['exit', 'quit', 'q']:
                     console.print("[yellow]시스템을 종료합니다.[/yellow]")
@@ -143,34 +170,73 @@ class TerminalRAG:
                     await self.load_documents()
                     continue
                 
+                if question.lower() == '/reload-all':
+                    await self.load_documents(force_reload=True)
+                    continue
+                
+                if question.lower() == '/reset':
+                    # 임베딩 상태 초기화 확인
+                    from rich.prompt import Confirm
+                    if Confirm.ask("[yellow]모든 임베딩 상태를 초기화하시겠습니까?[/yellow]"):
+                        loader = DocumentLoader()
+                        loader.reset_embedding_status()
+                        console.print("[green]임베딩 상태 초기화 완료. 다음 로드시 모든 파일이 재처리됩니다.[/green]")
+                    continue
+                
                 if question.lower() == '/help':
                     help_text = """
-사용 가능한 명령어:
-- /info    : 시스템 정보 표시
-- /reload  : 문서 다시 로드
-- /help    : 도움말 표시
-- exit/quit/q : 종료
+🔧 사용 가능한 명령어:
+- /info       : 시스템 정보 표시 (LLM 서비스, 인덱스 상태 등)
+- /reload     : 신규/변경된 문서만 다시 로드
+- /reload-all : 모든 문서 강제 재로드 (전체 재처리)
+- /reset      : 임베딩 상태 초기화 (다음 로드시 모든 파일 재처리)
+- /help       : 이 도움말 표시
+- exit/quit/q : 프로그램 종료
 
-질의 모드:
-기본적으로 hybrid 모드를 사용합니다.
+📋 사용 예시:
+- "LightRAG의 주요 특징은 무엇인가요?" (일반 질문)
+- "문서에서 성능 최적화 방법을 찾아주세요" (문서 검색)
+- "앞서 말한 내용을 다시 설명해주세요" (대화 맥락 활용)
+
+🔍 질의 모드:
+기본적으로 hybrid 모드를 사용합니다 (로컬+글로벌 검색 결합)
+- naive: 단순 벡터 검색
+- local: 로컬 지식 그래프 검색  
+- global: 글로벌 지식 그래프 검색
+- hybrid: 최적 결과를 위한 결합 방식
+
+📁 파일 처리:
+- 기본적으로 신규 또는 변경된 파일만 임베딩합니다
+- 파일 변경은 MD5 해시와 수정 시간으로 감지합니다
+- 지원 형식: .txt, .pdf, .docx, .md, .xlsx
+- input/ 폴더에 문서를 넣고 /reload 명령어 사용
+
+💡 팁:
+- 구체적인 질문일수록 더 정확한 답변을 받을 수 있습니다
+- 한국어와 영어 질문 모두 지원합니다
+- 이전 대화 내용을 기억하므로 연관 질문이 가능합니다
                     """
                     console.print(Panel(help_text, title="도움말", border_style="blue"))
                     continue
                 
                 # RAG 질의
-                with Progress(
-                    SpinnerColumn(),
-                    TextColumn("[progress.description]{task.description}"),
-                    console=console,
-                ) as progress:
-                    task = progress.add_task("[cyan]답변 생성 중...", total=None)
+                # with Progress(
+                #     SpinnerColumn(),
+                #     TextColumn("[progress.description]{task.description}"),
+                #     console=console,
+                # ) as progress:
+                #     task = progress.add_task("[cyan]답변 생성 중...", total=None)
                     
-                    try:
-                        response = await self.rag_service.query(question)
-                        progress.update(task, description="[green]완료!")
-                    except Exception as e:
-                        progress.update(task, description=f"[red]오류: {e}")
-                        continue
+                try:
+                    # 디버깅: query 호출 직전 로그
+                    logger.debug(f"[BEFORE_QUERY] 질문: '{question}' (길이: {len(question)})")
+                    console.print("[cyan]답변 생성 중...[/cyan]")
+                    response = await self.rag_service.query(question)
+                    # progress.update(task, description="[green]완료!")
+                except Exception as e:
+                    # progress.update(task, description=f"[red]오류: {e}")
+                    console.print(f"[red]오류: {e}[/red]")
+                    continue
                 
                 # 답변 표시
                 console.print("\n[bold blue]답변:[/bold blue]")
@@ -186,7 +252,9 @@ class TerminalRAG:
 # CLI 명령어들
 @app.command()
 def chat(
-    load_docs: bool = typer.Option(True, "--load-docs/--no-load-docs", help="시작 시 문서 로드 여부")
+    load_docs: bool = typer.Option(True, "--load-docs/--no-load-docs", help="시작 시 문서 로드 여부"),
+    reset_embeddings: bool = typer.Option(False, "--reset-embeddings", help="시작 시 모든 임베딩 상태 초기화"),
+    force_reload: bool = typer.Option(False, "--force-reload", help="모든 문서 강제 재로드")
 ):
     """대화형 Q&A 모드 시작"""
     async def run():
@@ -195,9 +263,19 @@ def chat(
         # 초기화
         await terminal_rag.initialize()
         
+        # 임베딩 상태 초기화 (옵션)
+        if reset_embeddings:
+            console.print("[yellow]임베딩 상태 초기화 중...[/yellow]")
+            from src.Service.document_loader import DocumentLoader
+            loader = DocumentLoader()
+            loader.reset_embedding_status()
+            console.print("[green]임베딩 상태 초기화 완료. RAG 서비스를 재초기화합니다.[/green]")
+            # RAG 서비스를 재초기화하여 삭제된 저장소를 다시 생성
+            await terminal_rag.initialize()
+        
         # 문서 로드
         if load_docs:
-            await terminal_rag.load_documents()
+            await terminal_rag.load_documents(force_reload=force_reload)
         
         # 대화형 모드
         await terminal_rag.interactive_mode()
@@ -206,12 +284,26 @@ def chat(
 
 
 @app.command()
-def load():
+def load(
+    force_reload: bool = typer.Option(False, "--force-reload", help="모든 문서 강제 재로드"),
+    reset_embeddings: bool = typer.Option(False, "--reset-embeddings", help="임베딩 상태 초기화 후 로드")
+):
     """input/ 폴더의 문서를 로드하고 인덱싱"""
     async def run():
         terminal_rag = TerminalRAG()
         await terminal_rag.initialize()
-        await terminal_rag.load_documents()
+        
+        # 임베딩 상태 초기화 (옵션)
+        if reset_embeddings:
+            console.print("[yellow]임베딩 상태 초기화 중...[/yellow]")
+            from src.Service.document_loader import DocumentLoader
+            loader = DocumentLoader()
+            loader.reset_embedding_status()
+            console.print("[green]임베딩 상태 초기화 완료. RAG 서비스를 재초기화합니다.[/green]")
+            # RAG 서비스를 재초기화하여 삭제된 저장소를 다시 생성
+            await terminal_rag.initialize()
+        
+        await terminal_rag.load_documents(force_reload=force_reload)
         console.print("[green]문서 로드 완료![/green]")
     
     asyncio.run(run())
@@ -256,6 +348,7 @@ def info():
         table.add_row("OpenRouter 모델", settings.openrouter_model)
     
     # 기타 설정
+    table.add_row("로그 레벨", settings.log_level)
     table.add_row("작업 디렉토리", str(settings.lightrag_working_dir))
     table.add_row("청크 크기", str(settings.lightrag_chunk_size))
     table.add_row("청크 오버랩", str(settings.lightrag_chunk_overlap))
