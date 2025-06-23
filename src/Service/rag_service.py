@@ -23,6 +23,8 @@ class RAGService:
         self.document_loader = DocumentLoader()
         self.llm_service = llm_service
         self.rag = rag_instance
+        # 대화 히스토리 저장용 리스트
+        self.conversation_history: list[dict[str, str]] = []  # [{role:"user"|"assistant", content:str}]
 
     @classmethod
     async def create(cls) -> "RAGService":
@@ -326,9 +328,16 @@ class RAGService:
             # 한국어 프롬프트 시스템을 LLM 단계에서 처리하도록 변경
             original_question = question
 
+            # --- 대화 히스토리 업데이트 (user) ---
+            self.conversation_history.append({"role": "user", "content": original_question})
+
             # LightRAG API 호환성 수정
             from lightrag import QueryParam
-            param = QueryParam(mode=mode)
+            param = QueryParam(
+                mode=mode,
+                conversation_history=self.conversation_history,
+                history_turns=settings.lightrag_history_turns,
+            )
             
             logger.debug("LightRAG 질의 시작...")
             response = await self.rag.aquery(original_question, param=param)
@@ -353,7 +362,11 @@ class RAGService:
             if answer and "[no-context]" in str(answer):
                 logger.warning(f"{mode} 모드에서 컨텍스트를 찾지 못했습니다. naive 모드로 재시도...")
                 try:
-                    param = QueryParam(mode="naive")
+                    param = QueryParam(
+                        mode="naive",
+                        conversation_history=self.conversation_history,
+                        history_turns=settings.lightrag_history_turns,
+                    )
                     response = await self.rag.aquery(original_question, param=param)
                     if isinstance(response, dict):
                         if 'response' in response:
@@ -376,15 +389,24 @@ class RAGService:
                     if _global_llm_service is not None:
                         async with _llm_semaphore:  # 세마포어 사용
                             korean_answer = await _global_llm_service.generate(korean_prompt)
-                            return korean_answer if korean_answer else answer
+                            # assistant 메시지 저장
+                            final_ans = korean_answer if korean_answer else answer
+                            self.conversation_history.append({"role": "assistant", "content": str(final_ans)})
+                            return final_ans
                     else:
                         logger.warning("전역 LLM 서비스가 없어 한국어 번역을 건너뜁니다")
+                        self.conversation_history.append({"role": "assistant", "content": str(answer)})
                         return answer
                 except Exception as e:
                     logger.warning(f"한국어 번역 실패: {e}")
+                    self.conversation_history.append({"role": "assistant", "content": str(answer)})
                     return answer
             
-            return answer if answer else "답변을 생성할 수 없습니다."
+            if answer:
+                self.conversation_history.append({"role": "assistant", "content": str(answer)})
+                return answer
+            else:
+                return "답변을 생성할 수 없습니다."
 
         except Exception as e:
             logger.error(f"질의 실패: {e}")

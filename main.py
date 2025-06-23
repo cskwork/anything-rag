@@ -16,23 +16,23 @@ from colorama import init as colorama_init
 # Windows 터미널 색상 지원
 colorama_init()
 
-# 로거 설정 (디버그 모드 활성화)
+# 모듈 임포트 (설정을 먼저 로드하기 위해)
+from src.Config.config import settings
+
+# 로거 설정 (설정에서 로그 레벨 사용)
 logger.remove()
 logger.add(
     sys.stderr,
-    level="DEBUG",  # 디버그 모드 강제 활성화
+    level=settings.log_level,  # .env에서 LOG_LEVEL 사용
     format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
 )
 logger.add(
-    "logs/app.log",
-    level="DEBUG",  # 디버그 모드 강제 활성화
+    "logs/app.log", 
+    level=settings.log_level,  # .env에서 LOG_LEVEL 사용
     rotation="10 MB",
     retention="7 days",
     format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}"
 )
-
-# 모듈 임포트
-from src.Config.config import settings
 from src.Service.rag_service import RAGService
 from src.Service.document_loader import DocumentLoader
 from src.Service.llm_service import get_llm_service
@@ -326,6 +326,7 @@ def info():
         table.add_row("OpenRouter 모델", settings.openrouter_model)
     
     # 기타 설정
+    table.add_row("로그 레벨", settings.log_level)
     table.add_row("작업 디렉토리", str(settings.lightrag_working_dir))
     table.add_row("청크 크기", str(settings.lightrag_chunk_size))
     table.add_row("청크 오버랩", str(settings.lightrag_chunk_overlap))

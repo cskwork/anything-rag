@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     lightrag_chunk_size: int = Field(default=1200, env="LIGHTRAG_CHUNK_SIZE")
     lightrag_chunk_overlap: int = Field(default=100, env="LIGHTRAG_CHUNK_OVERLAP")
     lightrag_embedding_model: str = Field(default="text-embedding-3-small", env="LIGHTRAG_EMBEDDING_MODEL")
+    lightrag_history_turns: int = Field(default=3, env="LIGHTRAG_HISTORY_TURNS")
     
     # 시스템 설정
     log_level: str = Field(default="INFO", env="LOG_LEVEL")
