@@ -1,11 +1,11 @@
 # LightRAG Terminal Q&A System
 
-LightRAG를 활용한 터미널 기반 문서 Q&A 시스템입니다. 한국어와 영어 문서를 지원하며, OpenRouter, OpenAI, Ollama 등 다양한 LLM 서비스를 사용할 수 있습니다.
+LightRAG를 활용한 터미널 기반 문서 Q&A 시스템입니다. 한국어와 영어 문서를 지원하며, 로컬 LLM API, OpenRouter, OpenAI, Ollama 등 다양한 LLM 서비스를 사용할 수 있습니다.
 
 ## ✨ 특징
 
 - 🚀 **LightRAG 기반**: 빠르고 효율적인 검색 증강 생성 (Retrieval-Augmented Generation)
-- 🌐 **다중 LLM 지원**: OpenRouter, OpenAI, Ollama 자동 감지 및 선택
+- 🌐 **다중 LLM 지원**: 로컬 LLM API, OpenRouter, OpenAI, Ollama 자동 감지 및 선택
 - 📄 **다양한 문서 형식**: TXT, PDF, DOCX, MD, XLSX 지원
 - 🇰🇷 **한국어/영어 지원**: 자동 언어 감지 및 처리
 - 💻 **풍부한 터미널 UI**: Rich 라이브러리 기반 아름다운 인터페이스
@@ -73,13 +73,36 @@ python main.py chat
 
 `.env` 파일에서 다음 설정을 구성하세요:
 
-### Ollama 사용 (기본값, 로컬 무료)
+### LLM 제공자 선택
+
+시스템은 다음 우선순위로 LLM 서비스를 자동 선택합니다:
+**로컬 LLM API → Ollama → OpenRouter**
+
+```env
+# LLM 제공자 선택 - 우선순위: local → ollama → openrouter  
+# Options: auto, local, ollama, openai, openrouter
+LLM_PROVIDER=auto
+```
+
+### 로컬 LLM API 사용 (최우선, 무료)
+
+```env
+# 로컬 LLM API 설정 (OpenAI 호환)
+LOCAL_API_HOST=http://localhost:3284
+LLM_PROVIDER=local  # 또는 auto (자동 감지)
+
+# 임베딩은 로컬 API → Ollama 폴백
+LIGHTRAG_EMBEDDING_MODEL=text-embedding-3-small
+```
+
+### Ollama 사용 (기본 폴백, 로컬 무료)
 
 ```env
 # Ollama 설정
 OLLAMA_HOST=http://localhost:11434
 OLLAMA_MODEL=gemma3:1b
 OLLAMA_EMBEDDING_MODEL=bge-m3:latest
+LLM_PROVIDER=ollama  # 또는 auto (자동 감지)
 
 # 시스템 설정
 LOG_LEVEL=INFO
@@ -92,6 +115,7 @@ LANGUAGE=ko
 # OpenAI 설정
 OPENAI_API_KEY=your_openai_api_key_here
 OPENAI_MODEL=gpt-3.5-turbo
+LLM_PROVIDER=openai  # 또는 auto (자동 감지)
 
 # LightRAG 임베딩 모델
 LIGHTRAG_EMBEDDING_MODEL=text-embedding-3-small
@@ -103,6 +127,7 @@ LIGHTRAG_EMBEDDING_MODEL=text-embedding-3-small
 # OpenRouter 설정
 OPENROUTER_API_KEY=your_openrouter_api_key_here
 OPENROUTER_MODEL=anthropic/claude-3-haiku
+LLM_PROVIDER=openrouter  # 또는 auto (자동 감지)
 
 # 또는 다른 모델들
 # OPENROUTER_MODEL=meta-llama/llama-3.1-8b-instruct:free
@@ -205,7 +230,8 @@ source .venv/bin/activate  # Linux/Mac
 pip install -r requirements.txt
 
 # 4. 환경 변수 설정 (.env 파일 생성)
-echo "OLLAMA_HOST=http://localhost:11434" > .env
+echo "LLM_PROVIDER=auto" > .env
+echo "OLLAMA_HOST=http://localhost:11434" >> .env
 echo "OLLAMA_MODEL=gemma3:1b" >> .env
 echo "LOG_LEVEL=INFO" >> .env
 
@@ -292,7 +318,7 @@ python main.py info
 
 **비교 및 분석:**
 ```
-질문: "Ollama와 OpenAI의 장단점을 비교해주세요"
+질문: "로컬 LLM API와 Ollama의 장단점을 비교해주세요"
 질문: "어떤 LLM 서비스를 선택해야 할까요?"
 질문: "각 질의 모드의 차이점은 무엇인가요?"
 ```
@@ -362,7 +388,8 @@ anything-rag/
 │   ├── 📂 Service/        # 🔧 핵심 서비스 로직
 │   │   ├── __init__.py
 │   │   ├── document_loader.py    # 문서 로딩 및 변경 감지
-│   │   ├── llm_service.py        # LLM 서비스 추상화
+│   │   ├── llm_service.py        # LLM 서비스 추상화 (로컬/Ollama/OpenAI/OpenRouter)
+│   │   ├── local_api_service.py  # 로컬 메시지 API 서비스
 │   │   └── rag_service.py        # RAG 메인 서비스
 │   ├── 📂 Utils/          # 🛠️ 유틸리티 함수들
 │   │   ├── __init__.py
@@ -383,9 +410,15 @@ anything-rag/
 
 ## 🔧 문제 해결
 
-### Ollama 관련
+### LLM 서비스 관련
 
-**연결 실패 시:**
+**로컬 LLM API 연결 실패 시:**
+1. 로컬 LLM 서버 상태 확인: `curl http://localhost:3284/health`
+2. OpenAI 호환 API 엔드포인트 확인: `/v1/chat/completions`, `/v1/embeddings`
+3. 서버 설정에서 포트 3284 허용 여부 확인
+4. 폴백으로 Ollama 사용됨
+
+**Ollama 연결 실패 시:**
 1. Ollama 설치: https://ollama.ai
 2. 모델 다운로드: `ollama pull gemma3:1b`
 3. 임베딩 모델: `ollama pull bge-m3:latest`

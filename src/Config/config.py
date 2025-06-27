@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 from typing import Optional, List
 from pydantic_settings import BaseSettings
-from pydantic import Field, computed_field
+from pydantic import Field, computed_field, field_validator
 from dotenv import load_dotenv
 
 # .env 파일 로드
@@ -24,6 +24,9 @@ class Settings(BaseSettings):
     ollama_model: str = Field(default="gemma3:1b", env="OLLAMA_MODEL")
     ollama_embedding_model: str = Field(default="bge-m3:latest", env="OLLAMA_EMBEDDING_MODEL")
     
+    # 로컬 API 설정
+    local_api_host: str = Field(default="http://localhost:3284", env="LOCAL_API_HOST")
+    
     # LightRAG 설정
     lightrag_working_dir: Path = Field(default=Path("./rag_storage"), env="LIGHTRAG_WORKING_DIR")
     lightrag_chunk_size: int = Field(default=1200, env="LIGHTRAG_CHUNK_SIZE")
@@ -37,6 +40,13 @@ class Settings(BaseSettings):
     max_tokens: int = Field(default=2000, env="MAX_TOKENS")
     temperature: float = Field(default=0.7, env="TEMPERATURE")
     embedding_dim: Optional[int] = Field(default=None, env="EMBEDDING_DIM")
+    
+    @field_validator('embedding_dim', mode='before')
+    @classmethod
+    def validate_embedding_dim(cls, v):
+        if v == '' or v is None:
+            return None
+        return int(v)
     
     # 문서 처리 설정
     supported_extensions_str: str = Field(
@@ -73,7 +83,7 @@ class Settings(BaseSettings):
     backup_dir: Path = Field(default=Path("./backup"), env="BACKUP_DIR")
     logs_dir: Path = Field(default=Path("./logs"), env="LOGS_DIR")
     
-    # LLM 제공자 선택 (auto, ollama, openai, openrouter)
+    # LLM 제공자 선택 (auto, local, ollama, openai, openrouter)
     llm_provider: str = Field(default="auto", env="LLM_PROVIDER")
     
     class Config:
@@ -81,11 +91,13 @@ class Settings(BaseSettings):
         env_file_encoding = "utf-8"
         
     def get_llm_service(self) -> str:
-        """사용 가능한 LLM 서비스 확인"""
-        if self.openrouter_api_key:
+        """사용 가능한 LLM 서비스 확인 - 우선순위: local → ollama → openrouter"""
+        if self.local_api_host:
+            return "local"
+        elif self.ollama_host:
+            return "ollama"
+        elif self.openrouter_api_key:
             return "openrouter"
-        elif self.openai_api_key:
-            return "openai"
         else:
             return "ollama"
     

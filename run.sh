@@ -30,11 +30,11 @@ source .venv/bin/activate
 
 # pip 업그레이드
 echo "[3/4] pip 업그레이드 중..."
-pip install --upgrade pip > /dev/null 2>&1
+pip3 install --upgrade pip > /dev/null 2>&1
 
 # 패키지 설치
 echo "[4/4] 필요한 패키지 설치 중..."
-pip install -r requirements.txt
+pip3 install -r requirements.txt
 
 if [ $? -ne 0 ]; then
     echo ""
@@ -48,8 +48,8 @@ fi
 # .env 파일 확인
 if [ ! -f ".env" ]; then
     echo ""
-    echo "[INFO] .env 파일이 없습니다. .env.example을 복사합니다."
-    cp .env.example .env
+    echo "[INFO] .env 파일이 없습니다. env.template을 복사합니다."
+    cp env.template .env
     echo ""
     echo "========================================"
     echo "[중요] .env 파일을 편집해주세요:"

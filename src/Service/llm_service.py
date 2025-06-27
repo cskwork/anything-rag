@@ -1,5 +1,6 @@
 """LLM 서비스 관리 모듈"""
 import os
+import aiohttp
 from typing import Optional, Dict, Any
 from abc import ABC, abstractmethod
 import ollama
@@ -405,6 +406,158 @@ class OpenRouterService(LLMService):
             return 384
 
 
+class LocalLLMService(LLMService):
+    """로컬 LLM API 서비스"""
+    
+    def __init__(self):
+        self.base_url = settings.local_api_host
+        self.embedding_model = settings.lightrag_embedding_model
+    
+    @classmethod
+    async def create(cls) -> "LocalLLMService":
+        """비동기 로컬 LLM 서비스 생성자"""
+        instance = cls()
+        # 연결 테스트
+        if not await instance._test_connection():
+            raise Exception(f"로컬 LLM API 연결 실패: {instance.base_url}")
+        return instance
+    
+    async def _test_connection(self) -> bool:
+        """로컬 LLM API 연결 테스트"""
+        try:
+            async with aiohttp.ClientSession() as session:
+                # 헬스체크 엔드포인트 시도
+                endpoints = ["/health", "/v1/models", "/ping", "/"]
+                for endpoint in endpoints:
+                    try:
+                        async with session.get(f"{self.base_url}{endpoint}", timeout=5) as response:
+                            if response.status in [200, 404]:  # 404도 서버가 응답하는 것으로 간주
+                                logger.info(f"로컬 LLM API 서버 연결 확인: {self.base_url}")
+                                return True
+                    except:
+                        continue
+                return False
+        except Exception as e:
+            logger.error(f"로컬 LLM API 연결 테스트 실패: {e}")
+            return False
+    
+    async def generate(self, prompt: str, **kwargs) -> str:
+        """텍스트 생성"""
+        try:
+            # OpenAI 호환 API 형식으로 요청
+            payload = {
+                "model": kwargs.get("model", "default"),
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": kwargs.get('temperature', settings.temperature),
+                "max_tokens": kwargs.get('max_tokens', settings.max_tokens),
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{self.base_url}/v1/chat/completions",
+                    json=payload,
+                    headers={"Content-Type": "application/json"}
+                ) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        return result["choices"][0]["message"]["content"]
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"로컬 LLM API 생성 실패 (HTTP {response.status}): {error_text}")
+                        raise Exception(f"로컬 LLM API 요청 실패: {response.status}")
+        except Exception as e:
+            logger.error(f"로컬 LLM 생성 오류: {e}")
+            raise
+    
+    async def embed(self, texts) -> list:
+        """텍스트 임베딩 - 로컬 API 또는 Ollama 폴백"""
+        try:
+            import numpy as np
+            
+            # 입력 처리
+            if isinstance(texts, str):
+                texts = [texts]
+            elif not isinstance(texts, list):
+                texts = [str(texts)]
+            
+            if not texts:
+                logger.warning("빈 텍스트 리스트에 대한 임베딩 요청")
+                return np.zeros((1, self.embedding_dim)).tolist()
+            
+            results = []
+            for text in texts:
+                if not text or not str(text).strip():
+                    embedding = [0.0] * self.embedding_dim
+                else:
+                    try:
+                        # 로컬 임베딩 API 시도
+                        payload = {
+                            "model": self.embedding_model,
+                            "input": str(text).strip()
+                        }
+                        
+                        async with aiohttp.ClientSession() as session:
+                            async with session.post(
+                                f"{self.base_url}/v1/embeddings",
+                                json=payload,
+                                headers={"Content-Type": "application/json"}
+                            ) as response:
+                                if response.status == 200:
+                                    result = await response.json()
+                                    embedding = result["data"][0]["embedding"]
+                                else:
+                                    # 로컬 임베딩 실패시 Ollama 폴백
+                                    logger.warning(f"로컬 임베딩 실패, Ollama 폴백 사용")
+                                    embedding = await self._fallback_embedding(text)
+                    except Exception as embed_error:
+                        logger.warning(f"로컬 임베딩 실패: {embed_error}, Ollama 폴백 사용")
+                        embedding = await self._fallback_embedding(text)
+                
+                results.append(embedding)
+            
+            if len(texts) == 1:
+                return results[0]
+            return results
+            
+        except Exception as e:
+            logger.error(f"로컬 LLM 임베딩 처리 중 오류: {e}")
+            # 더미 벡터 반환
+            dummy_dim = self.embedding_dim
+            if isinstance(texts, list) and len(texts) > 1:
+                return [[0.0] * dummy_dim for _ in texts]
+            else:
+                return [0.0] * dummy_dim
+    
+    async def _fallback_embedding(self, text: str) -> list:
+        """Ollama 폴백 임베딩"""
+        try:
+            # Ollama 클라이언트 생성
+            client = ollama.AsyncClient(host=settings.ollama_host)
+            response = await client.embeddings(
+                model=settings.ollama_embedding_model,
+                prompt=str(text).strip()
+            )
+            embedding = response.get('embedding', [])
+            if not embedding:
+                return [0.0] * self.embedding_dim
+            return embedding
+        except Exception as e:
+            logger.error(f"Ollama 폴백 임베딩 실패: {e}")
+            return [0.0] * self.embedding_dim
+    
+    @property
+    def embedding_dim(self) -> int:
+        """로컬 LLM 임베딩 차원"""
+        if settings.embedding_dim:
+            return settings.embedding_dim
+        # OpenAI 호환 모델 기본값
+        for model_key, dim in OPENAI_EMBEDDING_DIMS.items():
+            if model_key in self.embedding_model:
+                return dim
+        # 기본값
+        return 1536
+
+
 async def get_llm_service() -> LLMService:
     """설정에 따라 적절한 LLM 서비스 반환 (비동기)"""
     provider = settings.llm_provider.lower()
@@ -412,7 +565,14 @@ async def get_llm_service() -> LLMService:
     if provider == "auto":
         provider = settings.get_llm_service()
 
-    if provider == "openrouter":
+    if provider == "local":
+        logger.info("로컬 LLM API 서비스 사용 (LLM_PROVIDER)")
+        try:
+            return await LocalLLMService.create()
+        except Exception as e:
+            logger.warning(f"로컬 LLM API 서비스 실패, Ollama로 폴백: {e}")
+            return await OllamaService.create()
+    elif provider == "openrouter":
         logger.info("OpenRouter 서비스 사용 (LLM_PROVIDER)")
         return await OpenRouterService.create()
     elif provider == "openai":

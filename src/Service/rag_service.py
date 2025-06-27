@@ -3,10 +3,12 @@ import asyncio
 from typing import List, Dict, Optional, Any
 from pathlib import Path
 from loguru import logger
-from lightrag import LightRAG
+from lightrag import LightRAG, QueryParam
+from lightrag.utils import EmbeddingFunc
 from src.Config.config import settings
 from src.Service.llm_service import get_llm_service, LLMService
 from src.Service.document_loader import DocumentLoader
+from src.Service.local_api_service import LocalApiService
 
 # 전역 LLM 서비스 (직렬화 문제 해결을 위해)
 _global_llm_service: Optional[LLMService] = None
@@ -23,6 +25,7 @@ class RAGService:
         self.document_loader = DocumentLoader()
         self.llm_service = llm_service
         self.rag = rag_instance
+        self.local_api = LocalApiService()
         # 대화 히스토리 저장용 리스트
         self.conversation_history: list[dict[str, str]] = []  # [{role:"user"|"assistant", content:str}]
 
@@ -218,8 +221,6 @@ class RAGService:
                             return [0.0] * dummy_dim
 
             # LightRAG에서 EmbeddingFunc 래퍼 사용
-            from lightrag.utils import EmbeddingFunc
-            
             embedding_wrapper = EmbeddingFunc(
                 embedding_dim=llm_service.embedding_dim,
                 max_token_size=8192,
@@ -344,6 +345,12 @@ class RAGService:
             logger.debug(f"LightRAG 응답 타입: {type(response)}")
             logger.debug(f"LightRAG 응답 내용 (첫 200자): {str(response)[:200]}")
             
+            # 로컬 API에 질문과 답변 전송
+            try:
+                await self.local_api.send_rag_response(original_question, response)
+            except Exception as api_error:
+                logger.warning(f"로컬 API 전송 실패 (계속 진행): {api_error}")
+            
             # 응답이 dict 형태인 경우 처리
             if isinstance(response, dict):
                 if 'response' in response:
@@ -425,7 +432,13 @@ class RAGService:
             info: Dict[str, Any] = {
                 'working_dir': str(storage_path),
                 'exists': storage_path.exists(),
-                'files': []
+                'files': [],
+                'llm_service': settings.get_llm_service(),
+                'chunk_size': settings.lightrag_chunk_size,
+                'chunk_overlap': settings.lightrag_chunk_overlap,
+                'embedding_model': settings.lightrag_embedding_model,
+                'llm_provider': settings.llm_provider,
+                'local_api_host': settings.local_api_host,
             }
 
             if storage_path.exists():
@@ -435,6 +448,9 @@ class RAGService:
                             'name': file.name,
                             'size': file.stat().st_size
                         })
+
+            # 로컬 API 상태 확인
+            info["local_api_available"] = await self.local_api.is_api_available()
 
             return info
         except Exception as e:
