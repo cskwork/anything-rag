@@ -21,6 +21,11 @@ from loguru import logger
 logger.remove()
 logger.add(sink=sys.stdout, level="INFO", format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | {message}")
 
+# 현재: 최대 3개 동시 처리
+_embedding_semaphore = asyncio.Semaphore(3)
+# 개선: 5-8개로 증가 (하드웨어에 따라)
+_embedding_semaphore = asyncio.Semaphore(8)
+
 class RAGWorkflowTester:
     """RAG 워크플로우 테스트 클래스"""
     

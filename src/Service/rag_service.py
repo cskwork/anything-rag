@@ -15,9 +15,9 @@ from src.Service.local_api_service import LocalApiService
 _global_llm_service: Optional[LLMService] = None
 _global_embedding_service: Optional[LLMService] = None
 _global_kg_service: Optional[LLMService] = None
-# 동시성 제어를 위한 세마포어 (최대 2개의 동시 요청만 허용)
-_llm_semaphore = asyncio.Semaphore(2)
-_embedding_semaphore = asyncio.Semaphore(3)
+# 동시성 제어를 위한 세마포어 (최대 1개의 동시 요청만 허용)
+_llm_semaphore = asyncio.Semaphore(1)
+_embedding_semaphore = asyncio.Semaphore(1)
 
 # 임베딩 진행률 추적을 위한 전역 변수들
 _embedding_progress = {
