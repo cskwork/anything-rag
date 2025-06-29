@@ -318,11 +318,19 @@ class RAGService:
                                 _log_embedding_progress()
                                 return [[0.0] * _global_embedding_service.embedding_dim]
                             
+                            # 배치 임베딩 시작 로그
+                            if len(texts) > 1:
+                                logger.info(f"🔄 청크 임베딩 시작: {len(texts)}개 청크 처리")
+                            
                             # 각 텍스트에 대해 임베딩 생성 (순차 처리로 안정성 향상)
                             results = []
+                            batch_start_time = time.time()
+                            
                             for i, text in enumerate(texts):
+                                chunk_start_time = time.time()
+                                
                                 if not text or not str(text).strip():
-                                    logger.warning(f"빈 텍스트 항목 {i}에 대한 임베딩")
+                                    logger.warning(f"빈 텍스트 항목 {i+1}/{len(texts)}에 대한 임베딩")
                                     embedding = [0.0] * _global_embedding_service.embedding_dim
                                 else:
                                     # 재시도 로직 추가
@@ -331,26 +339,43 @@ class RAGService:
                                     for attempt in range(max_retries):
                                         try:
                                             embedding = await _global_embedding_service.embed(str(text))
-                                            logger.debug(f"텍스트 {i+1}/{len(texts)} 임베딩 차원: {len(embedding)}")
+                                            chunk_elapsed = time.time() - chunk_start_time
+                                            
+                                            # 텍스트 길이와 처리 시간 정보
+                                            text_len = len(str(text))
+                                            if len(texts) > 5:  # 많은 청크가 있을 때만 간헐적 로그
+                                                if i % 10 == 0 or i == len(texts) - 1:
+                                                    logger.info(f"   📝 청크 {i+1}/{len(texts)} 완료 "
+                                                              f"({text_len}글자, {chunk_elapsed:.1f}초, 차원:{len(embedding)})")
+                                            else:
+                                                logger.debug(f"텍스트 {i+1}/{len(texts)} 임베딩 완료 "
+                                                           f"({text_len}글자, {chunk_elapsed:.1f}초, 차원:{len(embedding)})")
                                             break
                                         except Exception as e:
-                                            logger.warning(f"embedding 서비스 텍스트 {i} 임베딩 실패 (시도 {attempt + 1}/{max_retries}): {e}")
+                                            logger.warning(f"임베딩 서비스 텍스트 {i+1} 실패 (시도 {attempt + 1}/{max_retries}): {e}")
                                             if attempt < max_retries - 1:
                                                 await asyncio.sleep(0.5)  # 0.5초 대기
                                             else:
-                                                logger.error(f"텍스트 {i} 임베딩 완전 실패, 더미 벡터 사용")
+                                                logger.error(f"텍스트 {i+1} 임베딩 완전 실패, 더미 벡터 사용")
                                                 embedding = [0.0] * _global_embedding_service.embedding_dim
                                 
                                 results.append(embedding)
                                 
                                 # 진행률 업데이트 (개별 텍스트별)
                                 _embedding_progress["completed_texts"] += 1
-                                if i % 5 == 0 or i == len(texts) - 1:  # 5개마다 또는 마지막에 로그
+                                if len(texts) > 10 and (i % 5 == 0 or i == len(texts) - 1):  # 5개마다 또는 마지막에 로그
                                     _log_embedding_progress()
                                 
                                 # 텍스트 간 약간의 지연으로 서버 부하 완화
                                 if i < len(texts) - 1:
-                                    await asyncio.sleep(0.1)
+                                    await asyncio.sleep(0.05)  # 지연 시간 단축
+                            
+                            # 배치 완료 로그
+                            batch_elapsed = time.time() - batch_start_time
+                            if len(texts) > 1:
+                                avg_per_chunk = batch_elapsed / len(texts)
+                                logger.info(f"✅ 청크 임베딩 완료: {len(texts)}개 청크, "
+                                          f"총 {batch_elapsed:.1f}초 (평균 {avg_per_chunk:.2f}초/청크)")
                             
                             _embedding_progress["completed_calls"] += 1
                             return results  # 중첩 리스트 형태로 반환
@@ -435,7 +460,7 @@ class RAGService:
             raise
 
     async def insert_documents(self, documents: Optional[List[Dict[str, str]]] = None, only_new: bool = True):
-        """문서를 RAG에 삽입
+        """문서를 RAG에 삽입 (진행률 추적 포함)
         
         Args:
             documents: 삽입할 문서 리스트 (None이면 자동 로드)
@@ -455,6 +480,11 @@ class RAGService:
                     logger.warning("삽입할 문서가 없습니다.")
                 return
 
+            # 진행률 추적 초기화
+            _reset_embedding_progress()
+            global _embedding_progress
+            _embedding_progress["start_time"] = time.time()
+            
             # LightRAG 전용 file_paths 매개변수 사용
             contents = [doc['content'] for doc in documents]
             file_paths = [doc.get('relative_path', doc['name']) for doc in documents]
@@ -463,24 +493,78 @@ class RAGService:
             for i, doc in enumerate(documents):
                 logger.debug(f"문서 {i+1} ({doc['path']}) 내용 (첫 200자): {doc['content'][:200]}")
 
-            logger.info(f"{len(documents)}개 문서 임베딩 시작...")
-            # LightRAG의 file_paths 매개변수를 사용하여 올바른 소스 정보 제공
-            try:
-                await self.rag.ainsert(contents, file_paths=file_paths)
-                logger.info(f"문서 임베딩 완료 - 총 {len(contents)}개 문서, 파일 경로 정보 포함")
-            except Exception as e:
-                logger.warning(f"file_paths 방식 실패: {e}, 기본 방식 시도...")
-                # 기본 방식으로 fallback
-                await self.rag.ainsert(contents)
-                logger.info(f"문서 임베딩 완료 - 총 {len(contents)}개 문서 (기본 방식)")
+            logger.info(f"📚 {len(documents)}개 문서 임베딩 시작...")
+            logger.info(f"💡 각 문서별 진행률과 처리 시간이 실시간으로 표시됩니다.")
+            
+            # 각 문서별 처리 시간 측정을 위한 개별 처리
+            success_count = 0
+            for i, (content, file_path) in enumerate(zip(contents, file_paths)):
+                try:
+                    # 문서별 시간 측정 시작
+                    doc_start_time = time.time()
+                    doc_name = f"{i+1}/{len(documents)} - {Path(file_path).name}"
+                    
+                    # 문서 크기 정보
+                    content_size = len(content)
+                    estimated_chunks = max(1, content_size // settings.lightrag_chunk_size)
+                    
+                    logger.info(f"📄 문서 임베딩 시작: {doc_name}")
+                    logger.info(f"   📏 크기: {content_size:,} 글자, 예상 청크: ~{estimated_chunks}개")
+                    
+                    # LightRAG의 file_paths 매개변수를 사용하여 올바른 소스 정보 제공
+                    try:
+                        await self.rag.ainsert([content], file_paths=[file_path])
+                        success_msg = f"✅ 문서 {i+1} 임베딩 성공: {Path(file_path).name}"
+                    except Exception as e:
+                        logger.warning(f"file_paths 방식 실패 (문서 {i+1}): {e}, 기본 방식 시도...")
+                        # 기본 방식으로 fallback
+                        await self.rag.ainsert([content])
+                        success_msg = f"✅ 문서 {i+1} 임베딩 성공 (기본 방식): {Path(file_path).name}"
+                    
+                    # 문서별 시간 측정 완료
+                    doc_elapsed = time.time() - doc_start_time
+                    _embedding_progress["document_times"].append(doc_elapsed)
+                    
+                    # 평균 시간 계산
+                    avg_time = sum(_embedding_progress["document_times"]) / len(_embedding_progress["document_times"])
+                    remaining_docs = len(documents) - (i + 1)
+                    eta = remaining_docs * avg_time if remaining_docs > 0 else 0
+                    
+                    logger.info(f"{success_msg}")
+                    logger.info(f"   ⏱️  소요시간: {doc_elapsed:.1f}초 (평균: {avg_time:.1f}초)")
+                    if remaining_docs > 0:
+                        logger.info(f"   🕐 예상 남은 시간: {eta:.0f}초 ({remaining_docs}개 문서 남음)")
+                    
+                    success_count += 1
+                    
+                except Exception as e:
+                    doc_elapsed = time.time() - doc_start_time
+                    logger.error(f"❌ 문서 {i+1} 임베딩 실패 ({Path(file_path).name}): {e}")
+                    logger.error(f"   ⏱️  실패까지 소요시간: {doc_elapsed:.1f}초")
+                    continue
+            
+            # 전체 완료 로그
+            total_time = time.time() - _embedding_progress["start_time"]
+            avg_doc_time = sum(_embedding_progress["document_times"]) / len(_embedding_progress["document_times"]) if _embedding_progress["document_times"] else 0
+            
+            logger.info(f"🎉 문서 임베딩 완료! 성공: {success_count}/{len(documents)}개")
+            logger.info(f"📊 총 소요시간: {total_time:.1f}초, 문서당 평균: {avg_doc_time:.1f}초")
+            logger.info(f"📈 임베딩 통계: 총 {_embedding_progress['completed_texts']}개 텍스트 청크, "
+                       f"{_embedding_progress['completed_calls']}회 API 호출")
+            
+            if _embedding_progress["completed_texts"] > 0:
+                rate = _embedding_progress["completed_texts"] / total_time
+                logger.info(f"⚡ 임베딩 속도: {rate:.1f}개 청크/초")
             
             # 문서들을 임베딩 완료로 표시
-            self.document_loader.mark_documents_embedded(documents)
+            successful_docs = documents[:success_count]  # 성공한 문서들만
+            if successful_docs:
+                self.document_loader.mark_documents_embedded(successful_docs)
             
             # 인덱싱 상태 확인
             try:
                 storage_info = await self.get_indexed_info()
-                logger.info(f"인덱스 상태: {storage_info}")
+                logger.info(f"💾 인덱스 상태: {storage_info}")
             except Exception as e:
                 logger.warning(f"인덱스 상태 확인 실패: {e}")
 

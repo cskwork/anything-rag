@@ -216,9 +216,19 @@ run_test() {
         python3 "$script_path"
         exit_code=$?
     else
-        # 간단 모드: 출력 숨기고 결과만 표시
-        output=$(python3 "$script_path" 2>&1)
-        exit_code=$?
+        # 간단 모드: 실시간 출력하되 진행률만 필터링
+        python3 "$script_path" 2>&1 | while IFS= read -r line; do
+            # 진행률, 문서 처리, 청크 임베딩 관련 로그는 항상 표시
+            if [[ "$line" =~ (📚|📄|🔄|✅|❌|📝|🕐|⏱️|🎉|📊|📈|⚡) ]] || 
+               [[ "$line" =~ "임베딩.*시작|임베딩.*완료|청크.*완료|진행률" ]] ||
+               [[ "$line" =~ "ERROR|WARN|FAIL" ]]; then
+                echo "$line"
+            # DEBUG나 INFO 중에서도 중요한 것들만
+            elif [[ "$line" =~ "INFO.*문서.*개|INFO.*청크.*개|INFO.*차원" ]]; then
+                echo "$line"
+            fi
+        done
+        exit_code=${PIPESTATUS[0]}  # python3 명령의 실제 exit code
     fi
     
     local end_time=$(date +%s)
