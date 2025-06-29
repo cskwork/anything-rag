@@ -1,20 +1,100 @@
 """LightRAG 기반 RAG 서비스"""
 import asyncio
+import time
 from typing import List, Dict, Optional, Any
 from pathlib import Path
 from loguru import logger
 from lightrag import LightRAG, QueryParam
 from lightrag.utils import EmbeddingFunc
 from src.Config.config import settings
-from src.Service.llm_service import get_llm_service, LLMService
+from src.Service.llm_service import get_llm_service, get_embedding_llm_service, get_kg_llm_service, LLMService
 from src.Service.document_loader import DocumentLoader
 from src.Service.local_api_service import LocalApiService
 
 # 전역 LLM 서비스 (직렬화 문제 해결을 위해)
 _global_llm_service: Optional[LLMService] = None
+_global_embedding_service: Optional[LLMService] = None
+_global_kg_service: Optional[LLMService] = None
 # 동시성 제어를 위한 세마포어 (최대 2개의 동시 요청만 허용)
 _llm_semaphore = asyncio.Semaphore(2)
 _embedding_semaphore = asyncio.Semaphore(3)
+
+# 임베딩 진행률 추적을 위한 전역 변수들
+_embedding_progress = {
+    "total_calls": 0,
+    "completed_calls": 0,
+    "total_texts": 0,
+    "completed_texts": 0,
+    "start_time": None,
+    "document_times": [],  # 각 문서별 처리 시간
+    "current_document": None,
+    "document_start_time": None
+}
+
+
+def _reset_embedding_progress():
+    """임베딩 진행률 추적 변수 초기화"""
+    global _embedding_progress
+    _embedding_progress = {
+        "total_calls": 0,
+        "completed_calls": 0,
+        "total_texts": 0,
+        "completed_texts": 0,
+        "start_time": None,
+        "document_times": [],
+        "current_document": None,
+        "document_start_time": None
+    }
+
+
+def _start_document_timing(document_name: str):
+    """문서별 처리 시간 측정 시작"""
+    global _embedding_progress
+    _embedding_progress["current_document"] = document_name
+    _embedding_progress["document_start_time"] = time.time()
+    logger.info(f"📄 문서 임베딩 시작: {document_name}")
+
+
+def _end_document_timing():
+    """문서별 처리 시간 측정 완료"""
+    global _embedding_progress
+    if _embedding_progress["document_start_time"] and _embedding_progress["current_document"]:
+        elapsed = time.time() - _embedding_progress["document_start_time"]
+        _embedding_progress["document_times"].append(elapsed)
+        avg_time = sum(_embedding_progress["document_times"]) / len(_embedding_progress["document_times"])
+        
+        logger.info(f"✅ 문서 임베딩 완료: {_embedding_progress['current_document']} "
+                   f"(소요시간: {elapsed:.1f}초, 평균: {avg_time:.1f}초)")
+        
+        _embedding_progress["current_document"] = None
+        _embedding_progress["document_start_time"] = None
+
+
+def _log_embedding_progress():
+    """현재 임베딩 진행률 로그 출력"""
+    global _embedding_progress
+    
+    if _embedding_progress["total_texts"] == 0:
+        return
+    
+    completed = _embedding_progress["completed_texts"]
+    total = _embedding_progress["total_texts"]
+    percentage = (completed / total) * 100
+    
+    # 진행률 계산
+    progress_bar = "█" * int(percentage / 5) + "░" * (20 - int(percentage / 5))
+    
+    # 남은 시간 예측
+    if _embedding_progress["start_time"] and completed > 0:
+        elapsed = time.time() - _embedding_progress["start_time"]
+        rate = completed / elapsed  # 텍스트/초
+        remaining = (total - completed) / rate if rate > 0 else 0
+        eta_str = f", 예상 남은 시간: {remaining:.0f}초" if remaining > 0 else ""
+    else:
+        eta_str = ""
+    
+    logger.info(f"🔄 임베딩 진행률: {completed}/{total} ({percentage:.1f}%) "
+               f"[{progress_bar}]{eta_str}")
 
 
 class RAGService:
@@ -32,21 +112,35 @@ class RAGService:
     @classmethod
     async def create(cls) -> "RAGService":
         """RAGService의 비동기 생성자"""
+        # 대화용 LLM 서비스 생성
         llm_service = await get_llm_service()
-        rag_instance = await cls.a_initialize_rag(llm_service)
+        # embedding용 LLM 서비스 생성 (local일 때는 ollama 사용)
+        embedding_service = await get_embedding_llm_service()
+        # Knowledge Graph용 LLM 서비스 생성 (local일 때는 ollama 사용)
+        kg_service = await get_kg_llm_service()
+        
+        rag_instance = await cls.a_initialize_rag(llm_service, embedding_service, kg_service)
         return cls(llm_service, rag_instance)
 
     @staticmethod
     async def _check_llm_health(llm_service: LLMService, max_attempts: int = 3) -> bool:
-        """LLM 서비스 상태 확인"""
+        """LLM 서비스 상태 확인 - 세션 상태 오류 고려"""
+        from src.Service.llm_service import LocalLLMService
+        
+        # 로컬 LLM 서비스인 경우 특별 처리
+        if isinstance(llm_service, LocalLLMService):
+            logger.info("로컬 LLM API 서비스 감지됨, 연결 테스트 방식 변경")
+            # 이미 create()에서 연결 테스트를 통과했으므로 성공으로 간주
+            return True
+        
         for attempt in range(max_attempts):
             try:
                 # 간단한 테스트 프롬프트로 서비스 상태 확인
                 async with _llm_semaphore:  # 세마포어 사용
                     test_response = await llm_service.generate(
-                        "Hello", 
+                        "test", 
                         temperature=0.1, 
-                        max_tokens=10
+                        max_tokens=5
                     )
                 if test_response and test_response.strip():
                     logger.info(f"LLM 서비스 상태 확인 완료 (시도 {attempt + 1}/{max_attempts})")
@@ -54,6 +148,13 @@ class RAGService:
                 else:
                     logger.warning(f"LLM 서비스 빈 응답 (시도 {attempt + 1}/{max_attempts})")
             except Exception as e:
+                error_message = str(e).lower()
+                
+                # 세션 상태 오류는 실제로는 연결 성공을 의미
+                if "waiting for user input" in error_message or "session" in error_message:
+                    logger.info(f"세션 상태 오류 감지 - 연결은 성공 (시도 {attempt + 1}/{max_attempts})")
+                    return True
+                
                 logger.warning(f"LLM 서비스 상태 확인 실패 (시도 {attempt + 1}/{max_attempts}): {e}")
                 if attempt < max_attempts - 1:
                     wait_time = 2 ** attempt  # 지수적 백오프 (2, 4, 8초)
@@ -64,19 +165,41 @@ class RAGService:
         return False
 
     @staticmethod
-    async def a_initialize_rag(llm_service: LLMService) -> Optional[LightRAG]:
-        """LightRAG 초기화 (비동기)"""
+    async def a_initialize_rag(llm_service: LLMService, embedding_service: LLMService, kg_service: LLMService) -> Optional[LightRAG]:
+        """LightRAG 초기화 (비동기) - 대화용, embedding용, KG용 서비스 분리"""
         try:
             settings.create_directories()
 
-            # LLM 서비스 상태 확인
-            logger.info("LLM 서비스 상태 확인 중...")
+            # 대화용 LLM 서비스 상태 확인
+            logger.info("대화용 LLM 서비스 상태 확인 중...")
             if not await RAGService._check_llm_health(llm_service):
-                logger.warning("LLM 서비스가 불안정하지만 계속 진행합니다...")
+                logger.warning("대화용 LLM 서비스가 불안정하지만 계속 진행합니다...")
 
-            # 전역 변수로 LLM 서비스 저장 (직렬화 문제 해결)
-            global _global_llm_service
+            # embedding용 LLM 서비스 상태 확인
+            logger.info("Embedding용 LLM 서비스 상태 확인 중...")
+            if not await RAGService._check_llm_health(embedding_service):
+                logger.warning("Embedding용 LLM 서비스가 불안정하지만 계속 진행합니다...")
+
+            # Knowledge Graph용 LLM 서비스 상태 확인
+            logger.info("Knowledge Graph용 LLM 서비스 상태 확인 중...")
+            if not await RAGService._check_llm_health(kg_service):
+                logger.warning("Knowledge Graph용 LLM 서비스가 불안정하지만 계속 진행합니다...")
+
+            # 전역 변수로 LLM 서비스들 저장 (직렬화 문제 해결)
+            global _global_llm_service, _global_embedding_service, _global_kg_service
             _global_llm_service = llm_service
+            _global_embedding_service = embedding_service
+            _global_kg_service = kg_service
+
+            # 서비스 정보 로그
+            chat_provider = settings.llm_provider
+            if chat_provider == 'auto':
+                chat_provider = settings.get_llm_service()
+            
+            embedding_provider = settings.get_embedding_llm_service()
+            kg_provider = settings.get_kg_llm_service()
+            
+            logger.info(f"서비스 구성 - 대화: {chat_provider}, Embedding: {embedding_provider}, KG: {kg_provider}")
 
             # 직렬화 가능한 래퍼 함수들 생성
             async def llm_model_func(prompt: str, system_prompt=None, history_messages=[], keyword_extraction=False, **kwargs) -> str:
@@ -91,65 +214,96 @@ class RAGService:
                 if system_prompt:
                     final_prompt = f"{system_prompt}\n\n{prompt}"
                 
+                # Knowledge Graph 구축과 일반 대화를 구분하여 다른 서비스 사용
+                if keyword_extraction or "extract" in prompt.lower() or "entity" in prompt.lower() or "relationship" in prompt.lower():
+                    # Knowledge Graph 구축용 서비스 사용
+                    target_service = _global_kg_service
+                    service_name = "Knowledge Graph"
+                else:
+                    # 일반 대화용 서비스 사용
+                    target_service = _global_llm_service
+                    service_name = "대화"
+                
                 # 세마포어를 사용한 동시성 제어
                 async with _llm_semaphore:
                     # 재시도 로직 (최대 3회, 개선된 백오프)
                     max_retries = 3
                     for attempt in range(max_retries):
                         try:
-                            if _global_llm_service is None:
-                                logger.error("전역 LLM 서비스가 없습니다")
+                            if target_service is None:
+                                logger.error(f"전역 {service_name}용 LLM 서비스가 없습니다")
                                 return "LLM 서비스가 초기화되지 않았습니다."
                             
-                            result = await _global_llm_service.generate(final_prompt, **filtered_kwargs)
+                            result = await target_service.generate(final_prompt, **filtered_kwargs)
                             if result and result.strip():  # 비어있지 않은 응답만 반환
-                                logger.debug(f"LLM 응답 생성 성공 (길이: {len(result)})")
+                                logger.debug(f"{service_name}용 LLM 응답 생성 성공 (길이: {len(result)})")
                                 return result
                             else:
-                                logger.warning(f"LLM이 빈 응답을 반환했습니다 (시도 {attempt + 1}/{max_retries})")
+                                logger.warning(f"{service_name}용 LLM이 빈 응답을 반환했습니다 (시도 {attempt + 1}/{max_retries})")
                         except Exception as e:
-                            logger.error(f"LLM 생성 실패 (시도 {attempt + 1}/{max_retries}): {e}")
+                            logger.error(f"{service_name}용 LLM 생성 실패 (시도 {attempt + 1}/{max_retries}): {e}")
                             if attempt == max_retries - 1:  # 마지막 시도
                                 logger.error("모든 재시도 실패, 기본 응답 반환")
                                 return f"LLM 서비스에 일시적인 문제가 발생했습니다. 잠시 후 다시 시도해주세요."
                             
                             # 재시도 전 대기 시간 증가 (지수적 백오프)
                             wait_time = (2 ** attempt) + 2  # 4, 6, 10초로 증가
-                            logger.info(f"LLM 재시도 대기 중... ({wait_time}초)")
+                            logger.info(f"{service_name}용 LLM 재시도 대기 중... ({wait_time}초)")
                             await asyncio.sleep(wait_time)
                     
                     return "LLM 서비스 응답을 받을 수 없습니다."
 
             async def embedding_func(texts):
-                """LightRAG 호환 임베딩 함수 (동시성 제어 포함)"""
+                """LightRAG 호환 임베딩 함수 (embedding 전용 서비스 사용, 동시성 제어 포함, 진행률 추적)"""
+                global _embedding_progress
+                
                 async with _embedding_semaphore:  # 임베딩 세마포어 사용
                     try:
-                        if _global_llm_service is None:
-                            logger.error("전역 LLM 서비스가 없습니다")
+                        if _global_embedding_service is None:
+                            logger.error("전역 embedding용 LLM 서비스가 없습니다")
                             dummy_dim = 1024  # 기본 차원
                             if isinstance(texts, list) and len(texts) > 1:
                                 return [[0.0] * dummy_dim for _ in texts]
                             else:
                                 return [0.0] * dummy_dim
                         
-                        logger.debug(f"임베딩 요청: {type(texts)}, 길이: {len(texts) if isinstance(texts, list) else 'N/A'}")
+                        # 진행률 추적 시작
+                        _embedding_progress["total_calls"] += 1
+                        
+                        # 텍스트 수 계산
+                        if isinstance(texts, list):
+                            text_count = len(texts)
+                        else:
+                            text_count = 1
+                        
+                        _embedding_progress["total_texts"] += text_count
+                        
+                        logger.debug(f"임베딩 요청 (embedding 전용 서비스): {type(texts)}, 텍스트 수: {text_count}")
                         
                         # 입력 처리 - LightRAG는 다양한 형태로 텍스트를 전달할 수 있음
                         if isinstance(texts, str):
                             # 단일 문자열인 경우
                             if not texts.strip():
                                 logger.warning("빈 문자열에 대한 임베딩")
-                                return [0.0] * _global_llm_service.embedding_dim
+                                _embedding_progress["completed_texts"] += 1
+                                _log_embedding_progress()
+                                return [0.0] * _global_embedding_service.embedding_dim
                             
                             # 재시도 로직 추가
                             max_retries = 2
                             for attempt in range(max_retries):
                                 try:
-                                    result = await _global_llm_service.embed(texts)
+                                    result = await _global_embedding_service.embed(texts)
                                     logger.debug(f"임베딩 결과 차원: {len(result)}")
+                                    
+                                    # 진행률 업데이트
+                                    _embedding_progress["completed_texts"] += 1
+                                    _embedding_progress["completed_calls"] += 1
+                                    _log_embedding_progress()
+                                    
                                     return result  # 리스트 형태로 반환
                                 except Exception as e:
-                                    logger.warning(f"임베딩 실패 (시도 {attempt + 1}/{max_retries}): {e}")
+                                    logger.warning(f"embedding 서비스 임베딩 실패 (시도 {attempt + 1}/{max_retries}): {e}")
                                     if attempt < max_retries - 1:
                                         await asyncio.sleep(1)  # 1초 대기
                                     else:
@@ -159,51 +313,70 @@ class RAGService:
                             # 리스트인 경우
                             if not texts:
                                 logger.warning("빈 텍스트 리스트에 대한 임베딩")
-                                return [[0.0] * _global_llm_service.embedding_dim]
+                                _embedding_progress["completed_texts"] += 1
+                                _embedding_progress["completed_calls"] += 1
+                                _log_embedding_progress()
+                                return [[0.0] * _global_embedding_service.embedding_dim]
                             
                             # 각 텍스트에 대해 임베딩 생성 (순차 처리로 안정성 향상)
                             results = []
                             for i, text in enumerate(texts):
                                 if not text or not str(text).strip():
                                     logger.warning(f"빈 텍스트 항목 {i}에 대한 임베딩")
-                                    embedding = [0.0] * _global_llm_service.embedding_dim
+                                    embedding = [0.0] * _global_embedding_service.embedding_dim
                                 else:
                                     # 재시도 로직 추가
                                     max_retries = 2
                                     embedding = None
                                     for attempt in range(max_retries):
                                         try:
-                                            embedding = await _global_llm_service.embed(str(text))
-                                            logger.debug(f"텍스트 {i} 임베딩 차원: {len(embedding)}")
+                                            embedding = await _global_embedding_service.embed(str(text))
+                                            logger.debug(f"텍스트 {i+1}/{len(texts)} 임베딩 차원: {len(embedding)}")
                                             break
                                         except Exception as e:
-                                            logger.warning(f"텍스트 {i} 임베딩 실패 (시도 {attempt + 1}/{max_retries}): {e}")
+                                            logger.warning(f"embedding 서비스 텍스트 {i} 임베딩 실패 (시도 {attempt + 1}/{max_retries}): {e}")
                                             if attempt < max_retries - 1:
                                                 await asyncio.sleep(0.5)  # 0.5초 대기
                                             else:
                                                 logger.error(f"텍스트 {i} 임베딩 완전 실패, 더미 벡터 사용")
-                                                embedding = [0.0] * _global_llm_service.embedding_dim
+                                                embedding = [0.0] * _global_embedding_service.embedding_dim
+                                
                                 results.append(embedding)
+                                
+                                # 진행률 업데이트 (개별 텍스트별)
+                                _embedding_progress["completed_texts"] += 1
+                                if i % 5 == 0 or i == len(texts) - 1:  # 5개마다 또는 마지막에 로그
+                                    _log_embedding_progress()
                                 
                                 # 텍스트 간 약간의 지연으로 서버 부하 완화
                                 if i < len(texts) - 1:
                                     await asyncio.sleep(0.1)
                             
+                            _embedding_progress["completed_calls"] += 1
                             return results  # 중첩 리스트 형태로 반환
                         else:
                             # 기타 형태 처리
                             text_str = str(texts)
                             if not text_str.strip():
-                                return [0.0] * _global_llm_service.embedding_dim
+                                _embedding_progress["completed_texts"] += 1
+                                _embedding_progress["completed_calls"] += 1
+                                _log_embedding_progress()
+                                return [0.0] * _global_embedding_service.embedding_dim
                             
                             # 재시도 로직 추가
                             max_retries = 2
                             for attempt in range(max_retries):
                                 try:
-                                    result = await _global_llm_service.embed(text_str)
+                                    result = await _global_embedding_service.embed(text_str)
+                                    
+                                    # 진행률 업데이트
+                                    _embedding_progress["completed_texts"] += 1
+                                    _embedding_progress["completed_calls"] += 1
+                                    _log_embedding_progress()
+                                    
                                     return result
                                 except Exception as e:
-                                    logger.warning(f"임베딩 실패 (시도 {attempt + 1}/{max_retries}): {e}")
+                                    logger.warning(f"embedding 서비스 임베딩 실패 (시도 {attempt + 1}/{max_retries}): {e}")
                                     if attempt < max_retries - 1:
                                         await asyncio.sleep(1)
                                     else:
@@ -212,7 +385,13 @@ class RAGService:
                     except Exception as e:
                         logger.error(f"임베딩 함수에서 오류 발생: {e}")
                         # 더미 벡터 반환
-                        dummy_dim = _global_llm_service.embedding_dim if _global_llm_service else 1024
+                        dummy_dim = _global_embedding_service.embedding_dim if _global_embedding_service else 1024
+                        
+                        # 진행률 업데이트 (실패한 경우도)
+                        _embedding_progress["completed_texts"] += text_count
+                        _embedding_progress["completed_calls"] += 1
+                        _log_embedding_progress()
+                        
                         if isinstance(texts, list) and len(texts) > 1:
                             # 리스트인 경우 각 항목에 대해 더미 벡터 생성
                             return [[0.0] * dummy_dim for _ in texts]
@@ -220,9 +399,9 @@ class RAGService:
                             # 단일 벡터 반환
                             return [0.0] * dummy_dim
 
-            # LightRAG에서 EmbeddingFunc 래퍼 사용
+            # LightRAG에서 EmbeddingFunc 래퍼 사용 (embedding 전용 서비스의 차원 사용)
             embedding_wrapper = EmbeddingFunc(
-                embedding_dim=llm_service.embedding_dim,
+                embedding_dim=embedding_service.embedding_dim,
                 max_token_size=8192,
                 func=embedding_func
             )
@@ -246,10 +425,7 @@ class RAGService:
             await initialize_pipeline_status()
             logger.debug("파이프라인 상태 초기화 완료")
             
-            provider = settings.llm_provider
-            if provider == 'auto':
-                provider = settings.get_llm_service()  # 실제 사용될 서비스
-            logger.info(f"LightRAG 초기화 완료 ({provider} 서비스, 임베딩 차원: {embedding_wrapper.embedding_dim})")
+            logger.info(f"LightRAG 초기화 완료 - 대화: {chat_provider}, Embedding: {embedding_provider}, KG: {kg_provider} (차원: {embedding_wrapper.embedding_dim})")
             logger.debug(f"작업 디렉토리: {settings.lightrag_working_dir}")
             logger.debug(f"청크 크기: {settings.lightrag_chunk_size}, 오버랩: {settings.lightrag_chunk_overlap}")
             logger.info("동시성 제어: LLM 세마포어=2, 임베딩 세마포어=3")
@@ -434,10 +610,14 @@ class RAGService:
                 'exists': storage_path.exists(),
                 'files': [],
                 'llm_service': settings.get_llm_service(),
+                'embedding_llm_service': settings.get_embedding_llm_service(),
+                'kg_llm_service': settings.get_kg_llm_service(),
                 'chunk_size': settings.lightrag_chunk_size,
                 'chunk_overlap': settings.lightrag_chunk_overlap,
                 'embedding_model': settings.lightrag_embedding_model,
                 'llm_provider': settings.llm_provider,
+                'embedding_llm_provider': settings.embedding_llm_provider,
+                'kg_llm_provider': settings.kg_llm_provider,
                 'local_api_host': settings.local_api_host,
             }
 

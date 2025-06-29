@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     
     # 로컬 API 설정
     local_api_host: str = Field(default="http://localhost:3284", env="LOCAL_API_HOST")
+    local_api_chat_endpoint: str = Field(default="/message", env="LOCAL_API_CHAT_ENDPOINT")
     
     # LightRAG 설정
     lightrag_working_dir: Path = Field(default=Path("./rag_storage"), env="LIGHTRAG_WORKING_DIR")
@@ -86,13 +87,26 @@ class Settings(BaseSettings):
     # LLM 제공자 선택 (auto, local, ollama, openai, openrouter)
     llm_provider: str = Field(default="auto", env="LLM_PROVIDER")
     
+    # Embedding 전용 LLM 제공자 설정 (local일 때는 항상 ollama 사용)
+    embedding_llm_provider: str = Field(default="auto", env="EMBEDDING_LLM_PROVIDER")
+    
+    # Knowledge Graph 전용 LLM 제공자 설정 (local일 때는 항상 ollama 사용)
+    kg_llm_provider: str = Field(default="auto", env="KG_LLM_PROVIDER")
+    
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
         
     def get_llm_service(self) -> str:
-        """사용 가능한 LLM 서비스 확인 - 우선순위: local → ollama → openrouter"""
-        if self.local_api_host:
+        """사용 가능한 LLM 서비스 확인 - local일 때도 ollama 우선 사용"""
+        # local 환경에서는 ollama를 우선 사용 (안정성을 위해)
+        if self.local_api_host and self.llm_provider == "auto":
+            # auto 모드에서는 ollama 우선, local은 fallback
+            if self.ollama_host:
+                return "ollama"
+            else:
+                return "local"
+        elif self.llm_provider == "local" and self.local_api_host:
             return "local"
         elif self.ollama_host:
             return "ollama"
@@ -100,6 +114,46 @@ class Settings(BaseSettings):
             return "openrouter"
         else:
             return "ollama"
+    
+    def get_embedding_llm_service(self) -> str:
+        """Embedding 전용 LLM 서비스 확인 - local일 때는 항상 ollama 사용"""
+        # local 환경에서는 embedding을 위해 항상 ollama 사용
+        if self.get_llm_service() == "local" or (self.local_api_host and self.embedding_llm_provider == "auto"):
+            return "ollama"
+        
+        # embedding_llm_provider 설정에 따라 결정
+        if self.embedding_llm_provider == "auto":
+            # auto인 경우 ollama → openai → openrouter 순으로 선택
+            if self.ollama_host:
+                return "ollama"
+            elif self.openai_api_key:
+                return "openai"
+            elif self.openrouter_api_key:
+                return "openrouter"
+            else:
+                return "ollama"
+        else:
+            return self.embedding_llm_provider
+    
+    def get_kg_llm_service(self) -> str:
+        """Knowledge Graph 전용 LLM 서비스 확인 - local일 때는 항상 ollama 사용"""
+        # local 환경에서는 KG 구축을 위해 항상 ollama 사용
+        if self.get_llm_service() == "local" or (self.local_api_host and self.kg_llm_provider == "auto"):
+            return "ollama"
+        
+        # kg_llm_provider 설정에 따라 결정
+        if self.kg_llm_provider == "auto":
+            # auto인 경우 ollama → openai → openrouter 순으로 선택
+            if self.ollama_host:
+                return "ollama"
+            elif self.openai_api_key:
+                return "openai"
+            elif self.openrouter_api_key:
+                return "openrouter"
+            else:
+                return "ollama"
+        else:
+            return self.kg_llm_provider
     
     def create_directories(self):
         """필요한 디렉토리 생성"""
@@ -110,3 +164,6 @@ class Settings(BaseSettings):
 
 # 전역 설정 인스턴스
 settings = Settings()
+
+# 프로젝트 루트 경로
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
