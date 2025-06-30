@@ -117,19 +117,38 @@ class TerminalRAG:
         console.print(table)
         
         # 문서 인덱싱
-        with Progress(
+        progress = Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             console=console,
-        ) as progress:
+        )
+        
+        try:
+            progress.start()
             task = progress.add_task("[cyan]문서 임베딩 중...", total=None)
             
-            try:
-                await self.rag_service.insert_documents(documents, only_new=not force_reload)
-                progress.update(task, description="[green]임베딩 완료!")
-            except Exception as e:
+            # 임베딩 실행
+            await self.rag_service.insert_documents(documents, only_new=not force_reload)
+            
+            # 성공 시 상태 업데이트 및 잠시 대기 후 종료
+            progress.update(task, description="[green]임베딩 완료!")
+            await asyncio.sleep(0.5)  # 상태 표시를 위한 짧은 대기
+            
+        except Exception as e:
+            # 실패 시 상태 업데이트 및 잠시 대기 후 종료
+            if 'task' in locals():
                 progress.update(task, description=f"[red]임베딩 실패: {e}")
-                raise
+                await asyncio.sleep(0.5)  # 에러 메시지 표시를 위한 짧은 대기
+            raise
+        finally:
+            # Progress 강제 종료
+            try:
+                progress.stop()
+            except Exception as stop_error:
+                logger.warning(f"Progress 종료 중 오류 (무시됨): {stop_error}")
+            
+            # 완료 메시지 출력
+            console.print("[green]✅ 문서 임베딩 처리 완료[/green]")
     
     async def interactive_mode(self):
         """대화형 모드"""

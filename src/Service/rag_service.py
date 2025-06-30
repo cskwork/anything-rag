@@ -15,9 +15,9 @@ from src.Service.local_api_service import LocalApiService
 _global_llm_service: Optional[LLMService] = None
 _global_embedding_service: Optional[LLMService] = None
 _global_kg_service: Optional[LLMService] = None
-# 동시성 제어를 위한 세마포어 (최대 1개의 동시 요청만 허용)
-_llm_semaphore = asyncio.Semaphore(1)
-_embedding_semaphore = asyncio.Semaphore(1)
+# 동시성 제어를 위한 세마포어 (LLM은 순차 처리, 임베딩은 병렬 처리)
+_llm_semaphore = asyncio.Semaphore(1)  # LLM 호출은 한 번에 하나씩만
+_embedding_semaphore = asyncio.Semaphore(2)
 
 # 임베딩 진행률 추적을 위한 전역 변수들
 _embedding_progress = {
@@ -224,34 +224,42 @@ class RAGService:
                     target_service = _global_llm_service
                     service_name = "대화"
                 
-                # 세마포어를 사용한 동시성 제어
-                async with _llm_semaphore:
-                    # 재시도 로직 (최대 3회, 개선된 백오프)
-                    max_retries = 3
-                    for attempt in range(max_retries):
-                        try:
-                            if target_service is None:
-                                logger.error(f"전역 {service_name}용 LLM 서비스가 없습니다")
-                                return "LLM 서비스가 초기화되지 않았습니다."
-                            
-                            result = await target_service.generate(final_prompt, **filtered_kwargs)
-                            if result and result.strip():  # 비어있지 않은 응답만 반환
-                                logger.debug(f"{service_name}용 LLM 응답 생성 성공 (길이: {len(result)})")
-                                return result
-                            else:
-                                logger.warning(f"{service_name}용 LLM이 빈 응답을 반환했습니다 (시도 {attempt + 1}/{max_retries})")
-                        except Exception as e:
-                            logger.error(f"{service_name}용 LLM 생성 실패 (시도 {attempt + 1}/{max_retries}): {e}")
-                            if attempt == max_retries - 1:  # 마지막 시도
-                                logger.error("모든 재시도 실패, 기본 응답 반환")
-                                return f"LLM 서비스에 일시적인 문제가 발생했습니다. 잠시 후 다시 시도해주세요."
-                            
-                            # 재시도 전 대기 시간 증가 (지수적 백오프)
-                            wait_time = (2 ** attempt) + 2  # 4, 6, 10초로 증가
-                            logger.info(f"{service_name}용 LLM 재시도 대기 중... ({wait_time}초)")
-                            await asyncio.sleep(wait_time)
-                    
-                    return "LLM 서비스 응답을 받을 수 없습니다."
+                # 세마포어를 사용한 동시성 제어 (타임아웃 추가)
+                async def _generate_with_semaphore():
+                    async with _llm_semaphore:
+                        # 재시도 로직 (최대 3회, 개선된 백오프)
+                        max_retries = 3
+                        for attempt in range(max_retries):
+                            try:
+                                if target_service is None:
+                                    logger.error(f"전역 {service_name}용 LLM 서비스가 없습니다")
+                                    return "LLM 서비스가 초기화되지 않았습니다."
+                                
+                                result = await target_service.generate(final_prompt, **filtered_kwargs)
+                                if result and result.strip():  # 비어있지 않은 응답만 반환
+                                    logger.debug(f"{service_name}용 LLM 응답 생성 성공 (길이: {len(result)})")
+                                    return result
+                                else:
+                                    logger.warning(f"{service_name}용 LLM이 빈 응답을 반환했습니다 (시도 {attempt + 1}/{max_retries})")
+                            except Exception as e:
+                                logger.error(f"{service_name}용 LLM 생성 실패 (시도 {attempt + 1}/{max_retries}): {e}")
+                                if attempt == max_retries - 1:  # 마지막 시도
+                                    logger.error("모든 재시도 실패, 기본 응답 반환")
+                                    return f"LLM 서비스에 일시적인 문제가 발생했습니다. 잠시 후 다시 시도해주세요."
+                                
+                                # 재시도 전 대기 시간 증가 (지수적 백오프)
+                                wait_time = (2 ** attempt) + 2  # 4, 6, 10초로 증가
+                                logger.info(f"{service_name}용 LLM 재시도 대기 중... ({wait_time}초)")
+                                await asyncio.sleep(wait_time)
+                        
+                        return "LLM 서비스 응답을 받을 수 없습니다."
+                
+                # 2분 타임아웃으로 LLM 호출 실행
+                try:
+                    return await asyncio.wait_for(_generate_with_semaphore(), timeout=120)
+                except asyncio.TimeoutError:
+                    logger.error(f"{service_name}용 LLM 호출 타임아웃 (2분)")
+                    return f"{service_name}용 LLM 서비스 타임아웃이 발생했습니다."
 
             async def embedding_func(texts):
                 """LightRAG 호환 임베딩 함수 (embedding 전용 서비스 사용, 동시성 제어 포함, 진행률 추적)"""
@@ -453,7 +461,7 @@ class RAGService:
             logger.info(f"LightRAG 초기화 완료 - 대화: {chat_provider}, Embedding: {embedding_provider}, KG: {kg_provider} (차원: {embedding_wrapper.embedding_dim})")
             logger.debug(f"작업 디렉토리: {settings.lightrag_working_dir}")
             logger.debug(f"청크 크기: {settings.lightrag_chunk_size}, 오버랩: {settings.lightrag_chunk_overlap}")
-            logger.info("동시성 제어: LLM 세마포어=2, 임베딩 세마포어=3")
+            logger.info("동시성 제어: LLM 세마포어=1 (순차), 임베딩 세마포어=2")
             return rag_instance
         except Exception as e:
             logger.error(f"LightRAG 초기화 실패: {e}")
@@ -513,13 +521,47 @@ class RAGService:
                     
                     # LightRAG의 file_paths 매개변수를 사용하여 올바른 소스 정보 제공
                     try:
-                        await self.rag.ainsert([content], file_paths=[file_path])
+                        logger.info(f"🔄 LightRAG ainsert 시작 (문서 {i+1}): {Path(file_path).name}")
+                        
+                        # 타임아웃 설정으로 무한 대기 방지
+                        insert_task = asyncio.create_task(
+                            self.rag.ainsert([content], file_paths=[file_path])
+                        )
+                        await asyncio.wait_for(insert_task, timeout=300)  # 5분 타임아웃
+                        
+                        logger.info(f"✅ LightRAG ainsert 완료 (문서 {i+1}): {Path(file_path).name}")
                         success_msg = f"✅ 문서 {i+1} 임베딩 성공: {Path(file_path).name}"
+                        
+                    except asyncio.TimeoutError:
+                        logger.error(f"⏰ 문서 {i+1} 처리 타임아웃 (5분): {Path(file_path).name}")
+                        # 타임아웃 발생 시 기본 방식으로 재시도
+                        try:
+                            logger.info(f"🔄 기본 방식으로 재시도 (문서 {i+1}): {Path(file_path).name}")
+                            basic_task = asyncio.create_task(
+                                self.rag.ainsert([content])
+                            )
+                            await asyncio.wait_for(basic_task, timeout=120)  # 2분 타임아웃
+                            success_msg = f"✅ 문서 {i+1} 임베딩 성공 (기본 방식, 재시도): {Path(file_path).name}"
+                        except asyncio.TimeoutError:
+                            logger.error(f"❌ 문서 {i+1} 최종 타임아웃: {Path(file_path).name}")
+                            raise Exception(f"문서 처리 타임아웃: {Path(file_path).name}")
+                        
                     except Exception as e:
                         logger.warning(f"file_paths 방식 실패 (문서 {i+1}): {e}, 기본 방식 시도...")
                         # 기본 방식으로 fallback
-                        await self.rag.ainsert([content])
-                        success_msg = f"✅ 문서 {i+1} 임베딩 성공 (기본 방식): {Path(file_path).name}"
+                        try:
+                            logger.info(f"🔄 기본 방식으로 fallback (문서 {i+1}): {Path(file_path).name}")
+                            basic_task = asyncio.create_task(
+                                self.rag.ainsert([content])
+                            )
+                            await asyncio.wait_for(basic_task, timeout=120)  # 2분 타임아웃
+                            success_msg = f"✅ 문서 {i+1} 임베딩 성공 (기본 방식): {Path(file_path).name}"
+                        except asyncio.TimeoutError:
+                            logger.error(f"❌ 문서 {i+1} 기본 방식도 타임아웃: {Path(file_path).name}")
+                            raise Exception(f"문서 처리 타임아웃: {Path(file_path).name}")
+                        except Exception as fallback_e:
+                            logger.error(f"❌ 문서 {i+1} 기본 방식도 실패: {fallback_e}")
+                            raise
                     
                     # 문서별 시간 측정 완료
                     doc_elapsed = time.time() - doc_start_time
