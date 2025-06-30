@@ -254,11 +254,12 @@ class RAGService:
                         
                         return "LLM 서비스 응답을 받을 수 없습니다."
                 
-                # 2분 타임아웃으로 LLM 호출 실행
+                # 설정된 타임아웃으로 LLM 호출 실행
+                timeout_value = settings.kg_timeout if service_name == "Knowledge Graph" else settings.llm_timeout
                 try:
-                    return await asyncio.wait_for(_generate_with_semaphore(), timeout=120)
+                    return await asyncio.wait_for(_generate_with_semaphore(), timeout=timeout_value)
                 except asyncio.TimeoutError:
-                    logger.error(f"{service_name}용 LLM 호출 타임아웃 (2분)")
+                    logger.error(f"{service_name}용 LLM 호출 타임아웃 ({timeout_value}초)")
                     return f"{service_name}용 LLM 서비스 타임아웃이 발생했습니다."
 
             async def embedding_func(texts):
@@ -527,20 +528,20 @@ class RAGService:
                         insert_task = asyncio.create_task(
                             self.rag.ainsert([content], file_paths=[file_path])
                         )
-                        await asyncio.wait_for(insert_task, timeout=300)  # 5분 타임아웃
+                        await asyncio.wait_for(insert_task, timeout=settings.embedding_timeout)  # 설정된 타임아웃 사용
                         
                         logger.info(f"✅ LightRAG ainsert 완료 (문서 {i+1}): {Path(file_path).name}")
                         success_msg = f"✅ 문서 {i+1} 임베딩 성공: {Path(file_path).name}"
                         
                     except asyncio.TimeoutError:
-                        logger.error(f"⏰ 문서 {i+1} 처리 타임아웃 (5분): {Path(file_path).name}")
+                        logger.error(f"⏰ 문서 {i+1} 처리 타임아웃 ({settings.embedding_timeout}초): {Path(file_path).name}")
                         # 타임아웃 발생 시 기본 방식으로 재시도
                         try:
                             logger.info(f"🔄 기본 방식으로 재시도 (문서 {i+1}): {Path(file_path).name}")
                             basic_task = asyncio.create_task(
                                 self.rag.ainsert([content])
                             )
-                            await asyncio.wait_for(basic_task, timeout=120)  # 2분 타임아웃
+                            await asyncio.wait_for(basic_task, timeout=settings.llm_timeout)  # 짧은 타임아웃으로 재시도
                             success_msg = f"✅ 문서 {i+1} 임베딩 성공 (기본 방식, 재시도): {Path(file_path).name}"
                         except asyncio.TimeoutError:
                             logger.error(f"❌ 문서 {i+1} 최종 타임아웃: {Path(file_path).name}")
@@ -554,7 +555,7 @@ class RAGService:
                             basic_task = asyncio.create_task(
                                 self.rag.ainsert([content])
                             )
-                            await asyncio.wait_for(basic_task, timeout=120)  # 2분 타임아웃
+                            await asyncio.wait_for(basic_task, timeout=settings.llm_timeout)  # 짧은 타임아웃으로 재시도
                             success_msg = f"✅ 문서 {i+1} 임베딩 성공 (기본 방식): {Path(file_path).name}"
                         except asyncio.TimeoutError:
                             logger.error(f"❌ 문서 {i+1} 기본 방식도 타임아웃: {Path(file_path).name}")

@@ -42,6 +42,11 @@ class Settings(BaseSettings):
     temperature: float = Field(default=0.7, env="TEMPERATURE")
     embedding_dim: Optional[int] = Field(default=None, env="EMBEDDING_DIM")
     
+    # 타임아웃 설정
+    llm_timeout: int = Field(default=120, env="LLM_TIMEOUT")  # LLM 호출 타임아웃 (초)
+    embedding_timeout: int = Field(default=300, env="EMBEDDING_TIMEOUT")  # 문서 임베딩 타임아웃 (초)
+    kg_timeout: int = Field(default=180, env="KG_TIMEOUT")  # Knowledge Graph 생성 타임아웃 (초)
+    
     @field_validator('embedding_dim', mode='before')
     @classmethod
     def validate_embedding_dim(cls, v):

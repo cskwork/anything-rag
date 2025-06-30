@@ -1,6 +1,7 @@
 """LightRAG 기반 터미널 Q&A 시스템"""
 import asyncio
 import sys
+import signal
 from pathlib import Path
 from typing import Optional
 import typer
@@ -123,12 +124,49 @@ class TerminalRAG:
             console=console,
         )
         
+        # 시그널 핸들러를 위한 이벤트
+        shutdown_event = asyncio.Event()
+        
+        def signal_handler(signame):
+            """시그널 핸들러"""
+            console.print(f"\n[yellow]⚠️  {signame} 시그널 수신 - 임베딩 작업 중단 중...[/yellow]")
+            shutdown_event.set()
+        
+        # 시그널 핸들러 등록
+        loop = asyncio.get_running_loop()
+        for signame in {'SIGINT', 'SIGTERM'}:
+            if hasattr(signal, signame):
+                loop.add_signal_handler(
+                    getattr(signal, signame),
+                    lambda s=signame: signal_handler(s)
+                )
+        
         try:
             progress.start()
             task = progress.add_task("[cyan]문서 임베딩 중...", total=None)
             
-            # 임베딩 실행
-            await self.rag_service.insert_documents(documents, only_new=not force_reload)
+            # 임베딩 실행 (비동기 태스크로)
+            embed_task = asyncio.create_task(
+                self.rag_service.insert_documents(documents, only_new=not force_reload)
+            )
+            shutdown_task = asyncio.create_task(shutdown_event.wait())
+            
+            # 둘 중 하나가 완료될 때까지 대기
+            done, pending = await asyncio.wait(
+                {embed_task, shutdown_task},
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            
+            if shutdown_task in done:
+                # 중단 신호 받음
+                progress.update(task, description="[yellow]작업 중단 중...[/yellow]")
+                embed_task.cancel()
+                try:
+                    await asyncio.wait_for(embed_task, timeout=5.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
+                console.print("[yellow]✋ 임베딩 작업이 중단되었습니다.[/yellow]")
+                return
             
             # 성공 시 상태 업데이트 및 잠시 대기 후 종료
             progress.update(task, description="[green]임베딩 완료!")
@@ -141,6 +179,14 @@ class TerminalRAG:
                 await asyncio.sleep(0.5)  # 에러 메시지 표시를 위한 짧은 대기
             raise
         finally:
+            # 시그널 핸들러 제거
+            for signame in {'SIGINT', 'SIGTERM'}:
+                if hasattr(signal, signame):
+                    try:
+                        loop.remove_signal_handler(getattr(signal, signame))
+                    except Exception:
+                        pass
+            
             # Progress 강제 종료
             try:
                 progress.stop()
